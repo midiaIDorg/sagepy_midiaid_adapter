@@ -292,6 +292,7 @@ results_view = scorer.score(db=indexed_db, spectrum=query_view)
 # OK, now make mz and intensity vectors for general case.
 precursor_stats_path = "tmp/clusters/tims/reformated/65/combined_cluster_stats.parquet"
 fragment_stats_path = "tmp/clusters/tims/reformated/67/combined_cluster_stats.parquet"
+edges_path = "tmp/edges/rough/76/rough_edges.startrek"
 
 to_dict = lambda df: {c: df[c].to_numpy() for c in df}
 
@@ -314,7 +315,7 @@ fragment_stats = to_dict(
 fragment_stats["intensity"] = fragment_stats["intensity"].astype(np.float32)
 fragment_stats["mz_wmean"] = fragment_stats["mz_wmean"].astype(np.float32)
 
-edges = to_dict(read_df("tmp/edges/rough/76/rough_edges.startrek"))
+edges = to_dict(read_df(edges_path))
 lx = LexicographicIndex(edges["MS1_ClusterID"])
 
 # this actually copies into RAM.
