@@ -18,6 +18,7 @@ dependencies = [
     "tqdm",
     "mmapped_df",
     "pandas_ops",
+    "sagepy",
 ]
 
 [project.scripts]
