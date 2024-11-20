@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools >= 64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name="sagepy_midiaid_adapter"
+version="0.0.1"
+description="Adapter for sagepy."
+readme="README.md"
+authors=[
+    {name="Mateusz Krzysztof Łącki",email="matteo.lacki@gmail.com"},
+    {name="David Teschner",email="dateschn@uni-mainz.de"},
+]
+dependencies = [
+    "click",
+    "numpy",
+    "numba",
+    "numba_progress",
+    "pandas",
+    "tqdm",
+    "mmapped_df",
+    "pandas_ops",
+]
+
+[project.scripts]
+sagepy_search = "sagepy_midiaid_adapter.cli.sagepy_search:sagepy_search"
+
+[project.urls]
+homepage="https://github.com/midiaIDorg/sagepy_midiaid_adapter.git"
+repository="https://github.com/midiaIDorg/sagepy_midiaid_adapter.git"
+
+[tool.uv]
+reinstall-package = ["sagepy_midiaid_adapter"]
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
