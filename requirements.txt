@@ -1,0 +1,4 @@
+git+https://github.com/midiaIDorg/pandas_ops
+git+https://github.com/michalsta/mmapped_df.git
+numpy
+tqdm
