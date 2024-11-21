@@ -1,20 +1,12 @@
-from sagepy.core import (
-    EnzymeBuilder,
-    Precursor,
-    ProcessedSpectrum,
-    RawSpectrum,
-    Representation,
-    SageSearchConfiguration,
-    Scorer,
-    SpectrumProcessor,
-    Tolerance,
-)
+from sagepy.core import (EnzymeBuilder, Precursor, ProcessedSpectrum,
+                         RawSpectrum, Representation, SageSearchConfiguration,
+                         Scorer, SpectrumProcessor, Tolerance)
 from tqdm import tqdm
 
 import numpy as np
 from pandas_ops.io import read_df
 from pandas_ops.lex_ops import LexicographicIndex
-from pandas_ops.stats import min_max
+from pandas_ops.stats import min_max, sum_real_good
 
 # configure a trypsin-like digestor of fasta files
 enzyme_builder = EnzymeBuilder(
@@ -267,13 +259,16 @@ query = spec_processor.process(raw_spectrum)
 
 # UPDATE: pass modifications to the scorer, necessary for PTM handling
 scorer = Scorer(
-    report_psms=2,
+    report_psms=100,
     min_matched_peaks=5,
     variable_mods=variable_mods,
     static_mods=static_mods,
 )
 results = scorer.score(db=indexed_db, spectrum=query)
+len(results)
 
+pepidx = results[-1].peptide_idx
+indexed_db[pepidx]
 
 raw_spectrum_view = RawSpectrum(
     file_id=1,
@@ -324,6 +319,8 @@ fragment_intensities = fragment_stats["intensity"][edges["MS2_ClusterID"]]
 
 MS1_ClusterIDs = edges["MS1_ClusterID"][lx.idx[:-1]]
 
+fragment_TICs = lx.map(sum_real_good, fragment_intensities)
+
 
 spec_processor = SpectrumProcessor(take_top_n=75)
 
@@ -339,9 +336,14 @@ for i in tqdm(range(len(lx))):
     raw_spectrum = RawSpectrum(
         file_id=1,
         spec_id=str(MS1_ClusterID),
-        total_ion_current=12667.0,
+        total_ion_current=fragment_TICs[MS1_ClusterID],
         precursors=[precursor],
         mz=fragment_mzs[lx.idx[i] : lx.idx[i + 1]],
         intensity=fragment_intensities[lx.idx[i] : lx.idx[i + 1]],
     )
     queries.append(spec_processor.process(raw_spectrum))
+
+# the number of reported ptms?
+
+potential_ptms -> each row = one PTM
+paired_fragments = each group of rows indexed by row number from potential_ptms is a group of fragments backing the PTM.
