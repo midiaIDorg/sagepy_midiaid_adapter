@@ -1,12 +1,11 @@
-from sagepy.core import (EnzymeBuilder, Precursor, ProcessedSpectrum,
-                         RawSpectrum, Representation, SageSearchConfiguration,
-                         Scorer, SpectrumProcessor, Tolerance)
-from tqdm import tqdm
-
 import numpy as np
 from pandas_ops.io import read_df
 from pandas_ops.lex_ops import LexicographicIndex
 from pandas_ops.stats import min_max, sum_real_good
+from sagepy.core import (EnzymeBuilder, Precursor, ProcessedSpectrum,
+                         RawSpectrum, Representation, SageSearchConfiguration,
+                         Scorer, SpectrumProcessor, Tolerance)
+from tqdm import tqdm
 
 # configure a trypsin-like digestor of fasta files
 enzyme_builder = EnzymeBuilder(
@@ -320,7 +319,7 @@ fragment_intensities = fragment_stats["intensity"][edges["MS2_ClusterID"]]
 MS1_ClusterIDs = edges["MS1_ClusterID"][lx.idx[:-1]]
 
 fragment_TICs = lx.map(sum_real_good, fragment_intensities)
-
+len(fragment_TICs)
 
 spec_processor = SpectrumProcessor(take_top_n=75)
 
@@ -336,7 +335,7 @@ for i in tqdm(range(len(lx))):
     raw_spectrum = RawSpectrum(
         file_id=1,
         spec_id=str(MS1_ClusterID),
-        total_ion_current=fragment_TICs[MS1_ClusterID],
+        total_ion_current=fragment_TICs[i],
         precursors=[precursor],
         mz=fragment_mzs[lx.idx[i] : lx.idx[i + 1]],
         intensity=fragment_intensities[lx.idx[i] : lx.idx[i + 1]],
