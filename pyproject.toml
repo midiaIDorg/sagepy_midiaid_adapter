@@ -21,6 +21,12 @@ dependencies = [
     "sagepy",
 ]
 
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+sagepy_midiaid_adapter=["data/*",]
+
 [project.scripts]
 sagepy_search = "sagepy_midiaid_adapter.cli.sagepy_search:sagepy_search"
 
