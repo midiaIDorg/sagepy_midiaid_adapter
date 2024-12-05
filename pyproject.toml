@@ -19,6 +19,7 @@ dependencies = [
     "mmapped_df",
     "pandas_ops",
     "sagepy",
+    "sagepy_connector",
 ]
 
 [tool.setuptools]
