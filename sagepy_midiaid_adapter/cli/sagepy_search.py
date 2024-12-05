@@ -13,6 +13,7 @@ from sagepy.qfdr.tdc import (
     target_decoy_competition_pandas,
 )
 from sagepy.utility import generate_search_configurations, psm_collection_to_pandas
+from imspy.algorithm.rescoring import create_feature_space, re_score_psms
 from tqdm import tqdm
 
 import numpy as np
@@ -189,11 +190,26 @@ def sagepy_search(
         # psm.sage_feature.fragments.mz_calculated
         # psm.sage_feature.fragments.mz_experimental
         break
+        
+    for psm in psm_list:
+        psm.retention_time /= 60.0
 
-    # assign SAGE q-values
-    assign_sage_spectrum_q(psm_list)
-    assign_sage_peptide_q(psm_list)
-    assign_sage_protein_q(psm_list)
+    if rescore_coarse_matches:
+    
+        psm_list = create_feature_space(
+            psms=psm_list,
+            fine_tune_im = False,
+            fine_tune_rt = False,
+        )
+        
+        psm_list = re_score_psms(
+            psm_list,
+        )
+    else:
+        # assign SAGE q-values
+        assign_sage_spectrum_q(psm_list)
+        assign_sage_peptide_q(psm_list)
+        assign_sage_protein_q(psm_list)
 
     # create a pandas dataframe
     # import pandas as pd
