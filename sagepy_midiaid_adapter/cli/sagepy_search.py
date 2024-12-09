@@ -8,6 +8,7 @@ from pathlib import Path
 from warnings import warn
 
 import click
+import mokapot
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
@@ -16,14 +17,14 @@ from imspy.algorithm.rescoring import create_feature_space, re_score_psms
 from pandas_ops.io import read_df
 from pandas_ops.lex_ops import LexicographicIndex
 from pandas_ops.stats import sum_real_good
-from sagepy.core import Precursor, RawSpectrum, Scorer, SpectrumProcessor
-from sagepy.qfdr.tdc import (
-    assign_sage_peptide_q,
-    assign_sage_protein_q,
-    assign_sage_spectrum_q,
-    target_decoy_competition_pandas,
-)
-from sagepy.utility import generate_search_configurations, psm_collection_to_pandas
+from sagepy.core import (Precursor, RawSpectrum, Scorer, SpectrumProcessor,
+                         Tolerance)
+from sagepy.qfdr.tdc import (assign_sage_peptide_q, assign_sage_protein_q,
+                             assign_sage_spectrum_q,
+                             target_decoy_competition_pandas)
+from sagepy.rescore.utility import transform_psm_to_mokapot_pin
+from sagepy.utility import (generate_search_configurations,
+                            psm_collection_to_pandas)
 from tqdm import tqdm
 
 
@@ -37,6 +38,7 @@ def create_query(
     edges: pd.DataFrame,
     spec_processor: SpectrumProcessor,
     progressbar_desc: str = "Prepping SAGEPY queries.",
+    min_peaks: int = 15,
 ) -> list:
     precursor_stats, fragment_stats, edges = map(
         to_dict, (precursor_stats, fragment_stats, edges)
@@ -53,30 +55,34 @@ def create_query(
 
     queries = []
     for i in tqdm(range(len(lx)), desc=progressbar_desc):
-        MS1_ClusterID = MS1_ClusterIDs[i]
-        precursor = Precursor(
-            mz=precursor_stats["mz_wmean"][MS1_ClusterID],
-            charge=None,
-            intensity=precursor_stats["intensity"][MS1_ClusterID],
-            inverse_ion_mobility=precursor_stats["inv_ion_mobility_wmean"][
-                MS1_ClusterID
-            ],
-        )
-        raw_spectrum = RawSpectrum(
-            file_id=1,
-            spec_id=str(MS1_ClusterID),
-            total_ion_current=fragment_TICs[i],
-            precursors=[precursor],
-            mz=fragment_mzs[lx.idx[i] : lx.idx[i + 1]],
-            intensity=fragment_intensities[lx.idx[i] : lx.idx[i + 1]],
-            scan_start_time=precursor_stats["retention_time_wmean"][MS1_ClusterID]
-            if retention_time_wmean_present
-            else None,
-            ion_injection_time=precursor_stats["retention_time_wmean"][MS1_ClusterID]
-            if retention_time_wmean_present
-            else None,
-        )
-        queries.append(spec_processor.process(raw_spectrum))
+        fragment_peaks_cnt = lx.idx[i + 1] - lx.idx[i]
+        if fragment_peaks_cnt >= min_peaks:
+            MS1_ClusterID = MS1_ClusterIDs[i]
+            precursor = Precursor(
+                mz=precursor_stats["mz_wmean"][MS1_ClusterID],
+                charge=None,
+                intensity=precursor_stats["intensity"][MS1_ClusterID],
+                inverse_ion_mobility=precursor_stats["inv_ion_mobility_wmean"][
+                    MS1_ClusterID
+                ],
+            )
+            raw_spectrum = RawSpectrum(
+                file_id=1,
+                spec_id=str(MS1_ClusterID),
+                total_ion_current=fragment_TICs[i],
+                precursors=[precursor],
+                mz=fragment_mzs[lx.idx[i] : lx.idx[i + 1]],
+                intensity=fragment_intensities[lx.idx[i] : lx.idx[i + 1]],
+                scan_start_time=precursor_stats["retention_time_wmean"][MS1_ClusterID]
+                if retention_time_wmean_present
+                else None,
+                ion_injection_time=precursor_stats["retention_time_wmean"][
+                    MS1_ClusterID
+                ]
+                if retention_time_wmean_present
+                else None,
+            )
+            queries.append(spec_processor.process(raw_spectrum))
 
     return queries
 
@@ -144,25 +150,76 @@ def sagepy_search(
     with open(search_config, "r") as f:
         search_conf = json.load(f)
 
+    # TODO: move to config
     search_conf["rescoring"] = dict(
-        fine_tune_im=True, fine_tune_rt=True, verbose=True
-    )  # move to config
-    run_rescoring = search_conf.get("rescoring", "") != ""
+        feature_space_settings=dict(
+            fine_tune_im=True,
+            fine_tune_rt=True,
+            verbose=True,
+        ),
+        engines=dict(
+            mokapot=dict(level="modified_peptide"),
+            david_teschners_random_combo=dict(
+                use_logreg=True,
+            ),
+        ),
+    )
 
     spec_processor = SpectrumProcessor(
-        take_top_n=75, min_deisotope_mz=0.0, deisotope=search_conf["deisotope"]
+        take_top_n=search_conf.get("max_peaks", 150),
+        min_deisotope_mz=0.0,
+        deisotope=search_conf["deisotope"],
     )
-    queries = create_query(precursor_stats, fragment_stats, edges, spec_processor)
+
+    queries = create_query(
+        precursor_stats,
+        fragment_stats,
+        edges,
+        spec_processor,
+        **{arg: search_conf[arg] for arg in ("min_peaks",) if arg in search_conf},
+    )
+
+    scorer_kwargs = {
+        arg: search_conf[arg]
+        for arg in (
+            "min_matched_peaks",
+            "min_isotope_err",
+            "max_isotope_err",
+            "chimera",
+            "report_psms",
+            "wide_window",
+            "score_type",
+            "max_fragment_charge",
+        )
+        if arg in search_conf
+    }
+
+    (
+        scorer_kwargs["min_precursor_charge"],
+        scorer_kwargs["max_precursor_charge"],
+    ) = search_conf["precursor_charge"]
+    (
+        scorer_kwargs["min_isotope_err"],
+        scorer_kwargs["max_isotope_err"],
+    ) = search_conf["isotope_errors"]
+
+    get_tol = lambda level: Tolerance(
+        **{k: tuple(v) for k, v in search_conf[level].items()}
+    )
+    for tol in ("precursor_tol", "fragment_tol"):
+        if tol in search_conf:
+            scorer_kwargs[f"{tol}erance"] = get_tol(tol)
 
     scorer = Scorer(
-        report_psms=search_conf["report_psms"],
-        min_matched_peaks=search_conf["min_peaks"],
         variable_mods=search_conf["database"]["variable_mods"],
         static_mods=search_conf["database"]["static_mods"],
+        annotate_matches=True,
+        override_precursor_charge=False,
+        **scorer_kwargs,
     )
 
     max_peptide_len = search_conf["database"]["enzyme"]["max_len"]
-    if run_rescoring and max_peptide_len > 30:
+    if "rescoring" in search_conf and max_peptide_len > 30:
         msg = f"You are doing rescoring and it must use fragment relative intensity prediction. The default fragment predictor cannot predict fragment intensities of fragments larger than 30 amino acids long. Clipping your choice of `{max_peptide_len}` to 30."
         warn(msg)
         max_peptide_len = 30
@@ -184,31 +241,146 @@ def sagepy_search(
         variable_mods=search_conf["database"]["variable_mods"],
         missed_cleavages=search_conf["database"]["enzyme"]["missed_cleavages"],
     )
+
     dbs = tqdm(dbs, total=num_splits, desc="Searching database.")
     psms = [
         scorer.score_collection_psm(db, queries, num_threads=num_threads) for db in dbs
     ]
+
     # max_hits = search_conf["max_retraining_psms"]
     merged_psms = functools.reduce(
         functools.partial(sagepy.core.scoring.merge_psm_dicts, max_hits=25), psms
     )
-
-    psm_list = [
-        psm
-        for psms in merged_psms.values()
-        for psm in psms
-        if psm.rank
-        <= search_conf["report_psms"]  # top rank == 1, ordered descending with score
-    ]
+    psm_list = [psm for psms in merged_psms.values() for psm in psms]
 
     # TODO: extract and save the SAGE matched peaks
     for psm in psm_list:
         psm.retention_time /= 60.0
 
-    if run_rescoring:
-        psm_list = create_feature_space(psms=psm_list, **search_conf["rescoring"])
-        psm_list = re_score_psms(psm_list, use_logreg=False)
+    if "rescoring" in search_conf:
+        psm_list = create_feature_space(
+            psms=psm_list,
+            **search_conf["rescoring"]["feature_space_settings"],
+        )
+
+        if "david_teschners_random_combo" in search_conf["rescoring"]["engines"]:
+            psm_list = re_score_psms(
+                psm_list,
+                **search_conf["rescoring"]["engines"]["david_teschners_random_combo"],
+            )
+
+        PSM_pandas = psm_collection_to_pandas(psm_list, num_threads=num_threads)
+
+        if "mokapot" in search_conf["rescoring"]["engines"]:
+            psms_moka = mokapot.read_pin(transform_psm_to_mokapot_pin(PSM_pandas))
+            results, _ = mokapot.brew(psms_moka, **)
+
+
+
+            columns_of_interest = [
+                "average_ppm",
+                "calcmass",
+                "charge",
+                "collision_energy",
+                "cosine_similarity",
+                "decoy",
+                "delta_best",
+                "delta_ims",
+                "delta_mass",
+                "delta_next",
+                "delta_rt",
+                "expmass",
+                "hyperscore",
+                "intensity_ms1",
+                "intensity_ms2",
+                "isotope_error",
+                "longest_b",
+                "longest_y",
+                "longest_y_pct",
+                "matched_intensity_pct",
+                "matched_peaks",
+                "missed_cleavages",
+                "pearson_correlation",
+                "poisson",
+                "proteins",
+                "rank",
+                "rt",
+                "spec_idx",
+                "spearman_correlation",
+                "spectral_angle_similarity",
+                "spectral_entropy_similarity",
+            ]
+
+            # TODO: put it in config:
+            match search_conf["rescoring"]["engines"]["mokapot"]["level"]:
+                case "peptide":
+                    level = ("peptide",)
+                case "modified_peptide":
+                    level = ("sequence",)
+                case "ion":
+                    level = (
+                        "peptide",
+                        "charge",
+                    )
+                case "modified_ion":
+                    level = (
+                        "sequence",
+                        "charge",
+                    )
+            columns_of_interest.extend(level)
+            PSM_pandas = PSM_pandas[columns_of_interest]
+
+            mokapot_kwargs = {}
+            if "seed" in search_conf["rescoring"]["engines"]["mokapot"]:
+                mokapot_kwargs["rng"] = search_conf["rescoring_engines"]["mokapot"][
+                    "seed"
+                ]
+
+            # PSM_pandas["decoy"] = [ 1 if d else -1 for d in PSM_pandas["decoy"]]
+            psm_moka = mokapot.LinearPsmDataset(
+                psms=PSM_pandas,
+                target_column="decoy",
+                spectrum_columns="spec_idx",
+                peptide_column="sequence",
+                protein_column="proteins",
+                # group_column=???,
+                feature_columns=None,
+                calcmass_column="calcmass",
+                expmass_column="expmass",
+                rt_column="rt",
+                charge_column="charge",
+                copy_data=True,
+                **mokapot_kwargs,
+            )
+            results, _ = mokapot.brew(psm_moka)
+            psm_moka.assign_confidence()
+
+            PSM_pandas["spec_idx"] = PSM_pandas["spec_idx"].astype(int)
+            PSM_pandas = PSM_pandas.merge(
+                results.psms,
+                how="left",
+                left_on="spec_idx",
+                right_on="SpecId",
+                suffixes=("", "_mokapot"),
+            )
+        psm_list = [
+            psm
+            for psm in psm_list
+            if psm.rank
+            <= search_conf[
+                "report_psms"
+            ]  # top rank == 1, ordered descending with score
+        ]
+
     else:
+        psm_list = [
+            psm
+            for psm in psm_list
+            if psm.rank
+            <= search_conf[
+                "report_psms"
+            ]  # top rank == 1, ordered descending with score
+        ]
         # assign SAGE q-values
         assign_sage_spectrum_q(psm_list)
         assign_sage_peptide_q(psm_list)
