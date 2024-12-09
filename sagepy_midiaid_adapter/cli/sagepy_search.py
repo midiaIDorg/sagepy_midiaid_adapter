@@ -275,85 +275,10 @@ def sagepy_search(
             psms_moka = mokapot.read_pin(transform_psm_to_mokapot_pin(PSM_pandas))
             results, _ = mokapot.brew(psms_moka, **)
 
-
-
-            columns_of_interest = [
-                "average_ppm",
-                "calcmass",
-                "charge",
-                "collision_energy",
-                "cosine_similarity",
-                "decoy",
-                "delta_best",
-                "delta_ims",
-                "delta_mass",
-                "delta_next",
-                "delta_rt",
-                "expmass",
-                "hyperscore",
-                "intensity_ms1",
-                "intensity_ms2",
-                "isotope_error",
-                "longest_b",
-                "longest_y",
-                "longest_y_pct",
-                "matched_intensity_pct",
-                "matched_peaks",
-                "missed_cleavages",
-                "pearson_correlation",
-                "poisson",
-                "proteins",
-                "rank",
-                "rt",
-                "spec_idx",
-                "spearman_correlation",
-                "spectral_angle_similarity",
-                "spectral_entropy_similarity",
-            ]
-
-            # TODO: put it in config:
-            match search_conf["rescoring"]["engines"]["mokapot"]["level"]:
-                case "peptide":
-                    level = ("peptide",)
-                case "modified_peptide":
-                    level = ("sequence",)
-                case "ion":
-                    level = (
-                        "peptide",
-                        "charge",
-                    )
-                case "modified_ion":
-                    level = (
-                        "sequence",
-                        "charge",
-                    )
-            columns_of_interest.extend(level)
-            PSM_pandas = PSM_pandas[columns_of_interest]
-
-            mokapot_kwargs = {}
             if "seed" in search_conf["rescoring"]["engines"]["mokapot"]:
                 mokapot_kwargs["rng"] = search_conf["rescoring_engines"]["mokapot"][
                     "seed"
                 ]
-
-            # PSM_pandas["decoy"] = [ 1 if d else -1 for d in PSM_pandas["decoy"]]
-            psm_moka = mokapot.LinearPsmDataset(
-                psms=PSM_pandas,
-                target_column="decoy",
-                spectrum_columns="spec_idx",
-                peptide_column="sequence",
-                protein_column="proteins",
-                # group_column=???,
-                feature_columns=None,
-                calcmass_column="calcmass",
-                expmass_column="expmass",
-                rt_column="rt",
-                charge_column="charge",
-                copy_data=True,
-                **mokapot_kwargs,
-            )
-            results, _ = mokapot.brew(psm_moka)
-            psm_moka.assign_confidence()
 
             PSM_pandas["spec_idx"] = PSM_pandas["spec_idx"].astype(int)
             PSM_pandas = PSM_pandas.merge(
@@ -363,6 +288,7 @@ def sagepy_search(
                 right_on="SpecId",
                 suffixes=("", "_mokapot"),
             )
+
         psm_list = [
             psm
             for psm in psm_list
