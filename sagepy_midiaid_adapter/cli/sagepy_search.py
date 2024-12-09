@@ -1,3 +1,6 @@
+# %load_ext autoreload
+# %autoreload 2
+
 import functools
 import json
 import os
@@ -114,6 +117,10 @@ def sagepy_search(
     num_threads: int = cores_cnt,
 ) -> None:
     """Run sagepy search"""
+
+    if num_threads > cores_cnt:
+        msg = f"You passed in `num_threads={num_threads}` but the max is `{cores_cnt}`. The `{cores_cnt}` will be used."
+        warn(msg)
 
     num_threads = min(num_threads, cores_cnt)
 
