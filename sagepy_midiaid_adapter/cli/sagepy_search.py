@@ -2,9 +2,17 @@ import functools
 import json
 import os
 from pathlib import Path
+from warnings import warn
 
 import click
+import numpy as np
+import numpy.typing as npt
+import pandas as pd
 import sagepy.core.scoring
+from imspy.algorithm.rescoring import create_feature_space, re_score_psms
+from pandas_ops.io import read_df
+from pandas_ops.lex_ops import LexicographicIndex
+from pandas_ops.stats import sum_real_good
 from sagepy.core import Precursor, RawSpectrum, Scorer, SpectrumProcessor
 from sagepy.qfdr.tdc import (
     assign_sage_peptide_q,
@@ -13,15 +21,7 @@ from sagepy.qfdr.tdc import (
     target_decoy_competition_pandas,
 )
 from sagepy.utility import generate_search_configurations, psm_collection_to_pandas
-from imspy.algorithm.rescoring import create_feature_space, re_score_psms
 from tqdm import tqdm
-
-import numpy as np
-import numpy.typing as npt
-import pandas as pd
-from pandas_ops.io import read_df
-from pandas_ops.lex_ops import LexicographicIndex
-from pandas_ops.stats import sum_real_good
 
 
 def to_dict(df: pd.DataFrame):
@@ -38,7 +38,6 @@ def create_query(
     precursor_stats, fragment_stats, edges = map(
         to_dict, (precursor_stats, fragment_stats, edges)
     )
-
     lx = LexicographicIndex(edges["MS1_ClusterID"])
 
     # this actually copies into RAM.
@@ -46,8 +45,8 @@ def create_query(
     fragment_intensities = fragment_stats["intensity"][edges["MS2_ClusterID"]]
 
     MS1_ClusterIDs = edges["MS1_ClusterID"][lx.idx[:-1]]
-
     fragment_TICs = lx.map(sum_real_good, fragment_intensities)
+    retention_time_wmean_present = "retention_time_wmean" in precursor_stats
 
     queries = []
     for i in tqdm(range(len(lx)), desc=progressbar_desc):
@@ -67,8 +66,12 @@ def create_query(
             precursors=[precursor],
             mz=fragment_mzs[lx.idx[i] : lx.idx[i + 1]],
             intensity=fragment_intensities[lx.idx[i] : lx.idx[i + 1]],
-            scan_start_time=precursor_stats["retention_time_wmean"][MS1_ClusterID],
-            ion_injection_time=precursor_stats["retention_time_wmean"][MS1_ClusterID],
+            scan_start_time=precursor_stats["retention_time_wmean"][MS1_ClusterID]
+            if retention_time_wmean_present
+            else None,
+            ion_injection_time=precursor_stats["retention_time_wmean"][MS1_ClusterID]
+            if retention_time_wmean_present
+            else None,
         )
         queries.append(spec_processor.process(raw_spectrum))
 
@@ -134,7 +137,14 @@ def sagepy_search(
     with open(search_config, "r") as f:
         search_conf = json.load(f)
 
-    spec_processor = SpectrumProcessor(take_top_n=75)
+    search_conf["rescoring"] = dict(
+        fine_tune_im=True, fine_tune_rt=True, verbose=True
+    )  # move to config
+    run_rescoring = search_conf.get("rescoring", "") != ""
+
+    spec_processor = SpectrumProcessor(
+        take_top_n=75, min_deisotope_mz=0.0, deisotope=search_conf["deisotope"]
+    )
     queries = create_query(precursor_stats, fragment_stats, edges, spec_processor)
 
     scorer = Scorer(
@@ -144,6 +154,12 @@ def sagepy_search(
         static_mods=search_conf["database"]["static_mods"],
     )
 
+    max_peptide_len = search_conf["database"]["enzyme"]["max_len"]
+    if run_rescoring and max_peptide_len > 30:
+        msg = f"You are doing rescoring and it must use fragment relative intensity prediction. The default fragment predictor cannot predict fragment intensities of fragments larger than 30 amino acids long. Clipping your choice of `{max_peptide_len}` to 30."
+        warn(msg)
+        max_peptide_len = 30
+
     # iterate over search configurations
     num_splits = 2
 
@@ -151,7 +167,7 @@ def sagepy_search(
         fasta_path=fasta,
         num_splits=num_splits,
         min_len=search_conf["database"]["enzyme"]["min_len"],
-        max_len=search_conf["database"]["enzyme"]["max_len"],
+        max_len=max_peptide_len,
         cleave_at=search_conf["database"]["enzyme"]["cleave_at"],
         restrict=search_conf["database"]["enzyme"]["restrict"],
         c_terminal=search_conf["database"]["enzyme"]["c_terminal"],
@@ -165,9 +181,11 @@ def sagepy_search(
     psms = [
         scorer.score_collection_psm(db, queries, num_threads=num_threads) for db in dbs
     ]
+    # max_hits = search_conf["max_retraining_psms"]
     merged_psms = functools.reduce(
         functools.partial(sagepy.core.scoring.merge_psm_dicts, max_hits=25), psms
     )
+
     psm_list = [
         psm
         for psms in merged_psms.values()
@@ -177,6 +195,19 @@ def sagepy_search(
     ]
 
     # TODO: extract and save the SAGE matched peaks
+    for psm in psm_list:
+        psm.retention_time /= 60.0
+
+    if run_rescoring:
+        psm_list = create_feature_space(psms=psm_list, **search_conf["rescoring"])
+        psm_list = re_score_psms(psm_list, use_logreg=False)
+    else:
+        # assign SAGE q-values
+        assign_sage_spectrum_q(psm_list)
+        assign_sage_peptide_q(psm_list)
+        assign_sage_protein_q(psm_list)
+
+    # Perform FDR filtering
 
     # HERE GOES MAPPING BACK
     for psm in psm_list:
@@ -190,26 +221,6 @@ def sagepy_search(
         # psm.sage_feature.fragments.mz_calculated
         # psm.sage_feature.fragments.mz_experimental
         break
-        
-    for psm in psm_list:
-        psm.retention_time /= 60.0
-
-    if rescore_coarse_matches:
-    
-        psm_list = create_feature_space(
-            psms=psm_list,
-            fine_tune_im = False,
-            fine_tune_rt = False,
-        )
-        
-        psm_list = re_score_psms(
-            psm_list,
-        )
-    else:
-        # assign SAGE q-values
-        assign_sage_spectrum_q(psm_list)
-        assign_sage_peptide_q(psm_list)
-        assign_sage_protein_q(psm_list)
 
     # create a pandas dataframe
     # import pandas as pd
