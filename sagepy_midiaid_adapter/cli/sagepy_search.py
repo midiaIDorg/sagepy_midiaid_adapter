@@ -1,31 +1,40 @@
-# %load_ext autoreload
-# %autoreload 2
-
+"""
+%load_ext autoreload
+%autoreload 2
+"""
 import functools
 import json
 import os
 from pathlib import Path
 from warnings import warn
+from scipy.interpolate import interp1d
 
 import click
 import mokapot
 import numpy as np
 import numpy.typing as npt
+import typing
 import pandas as pd
 import sagepy.core.scoring
 from imspy.algorithm.rescoring import create_feature_space, re_score_psms
 from pandas_ops.io import read_df
 from pandas_ops.lex_ops import LexicographicIndex
 from pandas_ops.stats import sum_real_good
-from sagepy.core import (Precursor, RawSpectrum, Scorer, SpectrumProcessor,
-                         Tolerance)
-from sagepy.qfdr.tdc import (assign_sage_peptide_q, assign_sage_protein_q,
-                             assign_sage_spectrum_q,
-                             target_decoy_competition_pandas)
+from sagepy.core import Precursor, RawSpectrum, Scorer, SpectrumProcessor, Tolerance
+from sagepy.qfdr.tdc import (
+    assign_sage_peptide_q,
+    assign_sage_protein_q,
+    assign_sage_spectrum_q,
+    target_decoy_competition_pandas,
+)
 from sagepy.rescore.utility import transform_psm_to_mokapot_pin
-from sagepy.utility import (generate_search_configurations,
-                            psm_collection_to_pandas)
+from sagepy.utility import generate_search_configurations, psm_collection_to_pandas
 from tqdm import tqdm
+from opentimspy import OpenTIMS
+
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_rows", 4)
 
 
 def to_dict(df: pd.DataFrame):
@@ -39,6 +48,7 @@ def create_query(
     spec_processor: SpectrumProcessor,
     progressbar_desc: str = "Prepping SAGEPY queries.",
     min_peaks: int = 15,
+    scan2ce: typing.Callable = lambda x: x,
 ) -> list:
     precursor_stats, fragment_stats, edges = map(
         to_dict, (precursor_stats, fragment_stats, edges)
@@ -65,6 +75,7 @@ def create_query(
                 inverse_ion_mobility=precursor_stats["inv_ion_mobility_wmean"][
                     MS1_ClusterID
                 ],
+                collision_energy=scan2ce(precursor_stats["scan_wmean"][MS1_ClusterID]),
             )
             raw_spectrum = RawSpectrum(
                 file_id=1,
@@ -97,13 +108,8 @@ def get_core_cnt() -> int:
 cores_cnt = get_core_cnt()
 
 
-# fasta = "fastas/Human_2024_02_16_UniProt_Taxon9606_Reviewed_20434entries_contaminant_tenzer.fasta"
-# precursor_cluster_stats = "tmp/clusters/tims/reformated/63/combined_cluster_stats.parquet"
-# fragment_cluster_stats = "tmp/clusters/tims/reformated/65/combined_cluster_stats.parquet"
-# edges = "tmp/edges/rough/69/rough_edges.startrek"
-# search_config = "tmp/configs/sage_config/109.json"
-# num_threads = 16
 @click.command(context_settings={"show_default": True})
+@click.argument("dataset", type=Path)
 @click.argument("fasta", type=Path)
 @click.argument("search_config", type=Path)
 @click.argument("precursor_cluster_stats", type=Path)
@@ -113,6 +119,7 @@ cores_cnt = get_core_cnt()
 @click.argument("matched_fragments_sage_parquet", type=Path)
 @click.option("--num_threads", type=int, default=cores_cnt)
 def sagepy_search(
+    dataset: Path,
     fasta: Path,
     search_config: Path,
     precursor_cluster_stats: Path,
@@ -123,6 +130,15 @@ def sagepy_search(
     num_threads: int = cores_cnt,
 ) -> None:
     """Run sagepy search"""
+
+    op = OpenTIMS(dataset)
+    DiaFrameMsMsWindows = pd.DataFrame(op.table2dict("DiaFrameMsMsWindows"))
+    scan2ce = interp1d(
+        DiaFrameMsMsWindows["ScanNumBegin"],
+        DiaFrameMsMsWindows["CollisionEnergy"],
+        kind="linear",
+        fill_value="extrapolate",
+    )
 
     if num_threads > cores_cnt:
         msg = f"You passed in `num_threads={num_threads}` but the max is `{cores_cnt}`. The `{cores_cnt}` will be used."
@@ -137,6 +153,7 @@ def sagepy_search(
             "intensity",
             "inv_ion_mobility_wmean",
             "retention_time_wmean",
+            "scan_wmean",
         ],
     )
     fragment_stats = read_df(
@@ -149,6 +166,17 @@ def sagepy_search(
 
     with open(search_config, "r") as f:
         search_conf = json.load(f)
+
+    search_conf["report_psms"] = 100
+
+    search_conf["database"]["static_mods"] = {
+        pos: mod.replace("U:", "UNIMOD:")
+        for pos, mod in search_conf["database"]["static_mods"].items()
+    }
+    search_conf["database"]["variable_mods"] = {
+        pos: [mod.replace("U:", "UNIMOD:") for mod in mods]
+        for pos, mods in search_conf["database"]["variable_mods"].items()
+    }
 
     # TODO: move to config
     search_conf["rescoring"] = dict(
@@ -176,6 +204,7 @@ def sagepy_search(
         fragment_stats,
         edges,
         spec_processor,
+        scan2ce=scan2ce,
         **{arg: search_conf[arg] for arg in ("min_peaks",) if arg in search_conf},
     )
 
@@ -219,6 +248,7 @@ def sagepy_search(
     )
 
     max_peptide_len = search_conf["database"]["enzyme"]["max_len"]
+
     if "rescoring" in search_conf and max_peptide_len > 30:
         msg = f"You are doing rescoring and it must use fragment relative intensity prediction. The default fragment predictor cannot predict fragment intensities of fragments larger than 30 amino acids long. Clipping your choice of `{max_peptide_len}` to 30."
         warn(msg)
@@ -247,10 +277,14 @@ def sagepy_search(
         scorer.score_collection_psm(db, queries, num_threads=num_threads) for db in dbs
     ]
 
+    for psm_l in psms:
+        assert len(psm_l) == len(psms[0])
+
     # max_hits = search_conf["max_retraining_psms"]
     merged_psms = functools.reduce(
         functools.partial(sagepy.core.scoring.merge_psm_dicts, max_hits=25), psms
     )
+    assert len(merged_psms) == len(psms[0])
     psm_list = [psm for psms in merged_psms.values() for psm in psms]
 
     # TODO: extract and save the SAGE matched peaks
@@ -271,23 +305,23 @@ def sagepy_search(
 
         PSM_pandas = psm_collection_to_pandas(psm_list, num_threads=num_threads)
 
-        if "mokapot" in search_conf["rescoring"]["engines"]:
-            psms_moka = mokapot.read_pin(transform_psm_to_mokapot_pin(PSM_pandas))
-            results, _ = mokapot.brew(psms_moka, **)
+        # if "mokapot" in search_conf["rescoring"]["engines"]:
+        #     psms_moka = mokapot.read_pin(transform_psm_to_mokapot_pin(PSM_pandas))
+        #     results, _ = mokapot.brew(psms_moka, **)
 
-            if "seed" in search_conf["rescoring"]["engines"]["mokapot"]:
-                mokapot_kwargs["rng"] = search_conf["rescoring_engines"]["mokapot"][
-                    "seed"
-                ]
+        #     if "seed" in search_conf["rescoring"]["engines"]["mokapot"]:
+        #         mokapot_kwargs["rng"] = search_conf["rescoring_engines"]["mokapot"][
+        #             "seed"
+        #         ]
 
-            PSM_pandas["spec_idx"] = PSM_pandas["spec_idx"].astype(int)
-            PSM_pandas = PSM_pandas.merge(
-                results.psms,
-                how="left",
-                left_on="spec_idx",
-                right_on="SpecId",
-                suffixes=("", "_mokapot"),
-            )
+        #     PSM_pandas["spec_idx"] = PSM_pandas["spec_idx"].astype(int)
+        #     PSM_pandas = PSM_pandas.merge(
+        #         results.psms,
+        #         how="left",
+        #         left_on="spec_idx",
+        #         right_on="SpecId",
+        #         suffixes=("", "_mokapot"),
+        #     )
 
         psm_list = [
             psm
@@ -311,6 +345,8 @@ def sagepy_search(
         assign_sage_spectrum_q(psm_list)
         assign_sage_peptide_q(psm_list)
         assign_sage_protein_q(psm_list)
+
+        PSM_pandas = psm_collection_to_pandas(psm_list, num_threads=num_threads)
 
     # Perform FDR filtering
 
