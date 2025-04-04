@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 from warnings import warn
 from scipy.interpolate import interp1d
+import itertools
 
 import click
 import mokapot
@@ -35,7 +36,9 @@ from opentimspy import OpenTIMS
 from pandas_ops.io import add_kwargs
 from sagepy.core.scoring import Psm as SagepyPsm
 import typing
-
+from typing import Callable
+from typing import Iterable
+from typing import Iterator
 
 pd.set_option("display.max_columns", None)
 pd.set_option("display.max_rows", 4)
@@ -44,8 +47,9 @@ pd.set_option("display.max_rows", 4)
 generate_search_configurations = add_kwargs(generate_search_configurations)
 
 
-def sanitize_search_config(search_conf: dict,
-    _MAX_PEP_LEN_FOR_INTENSITY_PREDICTION:int=30,
+def sanitize_search_config(
+    search_conf: dict,
+    _MAX_PEP_LEN_FOR_INTENSITY_PREDICTION: int = 30,
 ) -> dict:
     assert "enzyme" in search_conf["database"], "Missing database.enzyme settings."
 
@@ -53,10 +57,16 @@ def sanitize_search_config(search_conf: dict,
         msg = f"Missing database.enzyme.max_len setting. Setting to {_MAX_PEP_LEN_FOR_INTENSITY_PREDICTION}."
         warn(msg)
     else:
-        if "rescoring" in search_conf and search_conf["database"]["enzyme"]["max_len"] > _MAX_PEP_LEN_FOR_INTENSITY_PREDICTION:
+        if (
+            "rescoring" in search_conf
+            and search_conf["database"]["enzyme"]["max_len"]
+            > _MAX_PEP_LEN_FOR_INTENSITY_PREDICTION
+        ):
             msg = f"You are doing rescoring and it must use fragment relative intensity prediction. The default fragment predictor cannot predict fragment intensities of fragments larger than {_MAX_PEP_LEN_FOR_INTENSITY_PREDICTION} amino acids long. Clipping your choice of `{search_conf['database']['enzyme']['max_len']}` to {_MAX_PEP_LEN_FOR_INTENSITY_PREDICTION}."
             warn(msg)
-            search_conf["database"]["enzyme"]["max_len"] = _MAX_PEP_LEN_FOR_INTENSITY_PREDICTION
+            search_conf["database"]["enzyme"][
+                "max_len"
+            ] = _MAX_PEP_LEN_FOR_INTENSITY_PREDICTION
 
     assert (
         search_conf.get("report_psms", -1) > 0
@@ -65,7 +75,7 @@ def sanitize_search_config(search_conf: dict,
     if "rescoring" in search_conf:
         if search_conf["report_psms"] == 1:
             warn(
-                "You have passed in `report_psms = 1` in your config and you want rescoring (even though there is no mathematical theory behind it). Wise people in the field suggest using rescoring with more than 1 psm for rescoring, as if they had any idea how to prove that. Biology will go away. Math will stay."
+                "You have passed in `report_psms = 1` in your config and you want rescoring even though there IS NO MATHEMATICAL THEORY BEHIND ITS INFLUENCE ON FDR CALCULATIONS (SHAME!!! SHAME!!! SHAME!!!). Wise people in the field suggest using rescoring with more than 1 psm for rescoring, as if they had any idea how to prove that. Biology will go away. Math will stay."
             )
 
     search_conf["database"]["static_mods"] = {
@@ -114,7 +124,9 @@ def sanitized_search_config_to_scorer_kwargs(search_conf: dict) -> dict:
 
     scorer_kwargs["variable_mods"] = search_conf["database"].get("variable_mods", {})
     scorer_kwargs["static_mods"] = search_conf["database"].get("static_mods", {})
-    scorer_kwargs["override_precursor_charge"] = search_conf.get("override_precursor_charge", False)
+    scorer_kwargs["override_precursor_charge"] = search_conf.get(
+        "override_precursor_charge", False
+    )
 
     return scorer_kwargs
 
@@ -130,7 +142,7 @@ def create_query(
     spec_processor: SpectrumProcessor,
     progressbar_desc: str = "Prepping SAGEPY queries.",
     min_peaks: int = 15,
-    scan2ce: typing.Callable = lambda x: x,
+    scan2ce: Callable = lambda x: x,
 ) -> list:
     prec_stats, frag_stats, matches = map(
         to_dict, (precursor_stats, fragment_stats, edges)
@@ -201,9 +213,11 @@ def replace_short_unimod_with_long_unimod(short_unimod, verbose: False):
 
 
 def iter_merge_split_searches_dropping_target_decoy_collisions(
-    psms_in_splits: typing.Iterable[list[SagepyPsm]],
+    psms_in_splits: Iterable[list[SagepyPsm]],
     use_charges: bool = True,
-) -> typing.Iterable[SagepyPsm]:
+    *args,
+    **kwargs,
+) -> Iterable[SagepyPsm]:
     """Iterate PSMs from different DB splits.
 
     WARNING: we assume that fasta is split so that different splits do not contain the same protein header.
@@ -211,6 +225,7 @@ def iter_merge_split_searches_dropping_target_decoy_collisions(
     Arguments:
         psms_in_splits (Iterable of lists of SagepyPsms): Psms to merge. WARNING!!! TO BE CALLED ON THE SAME SPECTRUM PSMS.
         use_charges (bool): Merge by modified sequence and charge as criterion. When False, only by modified sequence.
+        *args, **kwargs: No influence.
 
     Yields:
         SagepyPsm: A PSM with protein sources adjusted for origins from different splits.
@@ -219,7 +234,7 @@ def iter_merge_split_searches_dropping_target_decoy_collisions(
     FIRST_TIME_FOUND = 0
 
     ion_to_psm_repr = {}
-    for psm in chain.from_iterable(psms_in_splits):
+    for psm in itertools.chain.from_iterable(psms_in_splits):
         ion = (psm.sequence, psm.sage_feature.charge) if use_charges else psm.sequence
 
         psm_repr = ion_to_psm_repr.get(ion, FIRST_TIME_FOUND)
@@ -241,9 +256,11 @@ def iter_merge_split_searches_dropping_target_decoy_collisions(
 
 
 def iter_merge_split_searches_retaining_targets_in_target_decoy_collisions(
-    psms_in_splits: typing.Iterable[list[SagepyPsm]],
+    psms_in_splits: Iterable[list[SagepyPsm]],
     use_charges: bool = True,
-) -> typing.Iterator[SagepyPsm]:
+    *args,
+    **kwargs,
+) -> Iterator[SagepyPsm]:
     """Iterate PSMs from different DB splits.
 
     WARNING: we assume that fasta is split so that different splits do not contain the same protein header.
@@ -251,6 +268,7 @@ def iter_merge_split_searches_retaining_targets_in_target_decoy_collisions(
     Arguments:
         psms_in_splits (Iterable of lists of SagepyPsms): Psms to merge. WARNING!!! TO BE CALLED ON THE SAME SPECTRUM PSMS.
         use_charges (bool): Merge by modified sequence and charge as criterion. When False, only by modified sequence.
+        *args, **kwargs: No influence.
 
     Yields:
         SagepyPsm: A PSM with protein sources adjusted for origins from different splits.
@@ -258,7 +276,7 @@ def iter_merge_split_searches_retaining_targets_in_target_decoy_collisions(
     FIRST_TIME_FOUND = 0
 
     ion_to_psm_repr = {}
-    for psm in chain.from_iterable(psms_in_splits):
+    for psm in itertools.chain.from_iterable(psms_in_splits):
         ion = (psm.sequence, psm.sage_feature.charge) if use_charges else psm.sequence
 
         psm_repr = ion_to_psm_repr.get(ion, FIRST_TIME_FOUND)
@@ -275,18 +293,60 @@ def iter_merge_split_searches_retaining_targets_in_target_decoy_collisions(
     yield from ion_to_psm_repr.values()
 
 
-valid_db_splits_merge_strategy: dict[str, typing.Iterator[SagepyPsm]] = dict(
-    drop_target_decoy_collisions=iter_merge_split_searches_dropping_target_decoy_collisions,
-    retain_targets_if_colliding_with_decoys=iter_merge_split_searches_retaining_targets_in_target_decoy_collisions,
+def iter_merge_psms(
+    spectrum_psms_merger: Iterator[list[SagepyPsm]],
+) -> Callable[[list[dict[str, list[SagepyPsm]]], ...], list[SagepyPsm]]:
+    @functools.wraps(spectrum_psms_merger)
+    def wrapper(psms_dcts, *args, **kwargs):
+        return list(
+            itertools.chain.from_iterable(
+                (
+                    spectrum_psms_merger(psms_per_spectrum, *args, **kwargs)
+                    for psms_per_spectrum in zip(
+                        *(psm_dct.values() for psm_dct in psms_dcts)
+                    )
+                )
+            )
+        )
+
+    return wrapper
+
+
+def david_teschner_happy_merge(
+    psms_in_splits: Iterable[list[SagepyPsm]],
+    *args,
+    **kwargs,
+) -> list[SagepyPsm]:
+    merged_psms = functools.reduce(
+        functools.partial(
+            sagepy.core.scoring.merge_psm_dicts,
+            max_hits=search_conf["report_psms"],
+        ),
+        psms_in_splits,
+    )
+    psms = [psm for psms in merged_psms.values() for psm in psms]
+    return psms
+
+
+DB_splits_mergers: dict[
+    str, Callable[Iterable[list[SagepyPsm]], list[SagepyPsm]]
+] = dict(
+    drop_target_decoy_collisions=iter_merge_psms(
+        iter_merge_split_searches_dropping_target_decoy_collisions
+    ),
+    retain_targets_if_colliding_with_decoys=iter_merge_psms(
+        iter_merge_split_searches_retaining_targets_in_target_decoy_collisions
+    ),
+    david_teschner_happy_merge=david_teschner_happy_merge,
 )
 
 
-def get_fragments_df(
-    psm_list,
+def psms_to_df(
+    psms: list[SagepyPsm],
     fragment_type_as_char: bool = True,
     verbose: bool = False,
 ) -> pd.DataFrame:
-    fragment_table_size = sum((psm.sage_feature.matched_peaks for psm in psm_list))
+    fragment_table_size = sum((psm.sage_feature.matched_peaks for psm in psms))
 
     fragment_psm_id = np.zeros(fragment_table_size, dtype=np.int64)
     fragment_type = np.zeros(fragment_table_size, dtype=np.uint8)
@@ -302,7 +362,7 @@ def get_fragments_df(
         progress_bar = tqdm(
             total=fragment_table_size, desc="Writing down fragments table"
         )
-    for psm_id, psm in enumerate(psm_list):
+    for psm_id, psm in enumerate(psms):
         psm_frag_cnt = psm.sage_feature.matched_peaks
         fragments = psm.sage_feature.fragments
         for i in range(psm_frag_cnt):
@@ -370,32 +430,33 @@ def sagepy_search(
 
     num_threads = min(num_threads, cores_cnt)
 
-
     with open(search_config, "r") as f:
         search_conf = sanitize_search_config(json.load(f))
-
     scorer_kwargs = sanitized_search_config_to_scorer_kwargs(search_conf)
 
     if num_splits > 1:
-        psm_merge_strategy = search_conf.get("psm_merge_strategy", "drop_target_decoy_collisions")
-        assert (
-            psm_merge_strategy in valid_db_splits_merge_strategy
-        ), f"Currently supported DB splits merge strategies include: {list(valid_db_splits_merge_strategy)}"
+        try:
+            DB_splits_merger = DB_splits_mergers[
+                search_conf.get("psm_merge_strategy", "drop_target_decoy_collisions")
+            ]
+        except KeyError as exc:
+            raise KeyError(
+                f"Currently supported DB splits merge strategies include: {list(DB_splits_mergers)}. You passed in `{exc}`."
+            ) from exc
 
-    # GET RID OF THIS.
-    search_conf["deisotope"] = True
-    search_conf["report_psms"] = 1
-    # search_conf["predict_rt"] = False
+    if not search_conf["deisotope"]:
+        warn("Are you sure you do not want SAGEPY to run deisotoping?")
 
-    op = OpenTIMS(dataset)
-    DiaFrameMsMsWindows = pd.DataFrame(op.table2dict("DiaFrameMsMsWindows"))
+    DiaFrameMsMsWindows = pd.DataFrame(
+        OpenTIMS(dataset).table2dict("DiaFrameMsMsWindows")
+    )
     scan2ce = interp1d(
         DiaFrameMsMsWindows["ScanNumBegin"],
         DiaFrameMsMsWindows["CollisionEnergy"],
         kind="linear",
         fill_value="extrapolate",
     )
-    
+
     precursor_stats = read_df(
         precursor_cluster_stats,
         columns=[
@@ -440,64 +501,15 @@ def sagepy_search(
 
     if verbose:
         dbs = tqdm(dbs, total=num_splits, desc="Searching database.")
-    
-    psms = [
+
+    psms_dcts: list[dict[str, list[SagepyPsm]]] = [
         scorer.score_collection_psm(db, queries, num_threads=num_threads) for db in dbs
-    ]  # list of spectrum id to list of psms
-    for psm_l in psms:
-        assert len(psm_l) == len(psms[0])
+    ]  # str = spec_idx
 
-    if num_splits > 1:
-        valid_db_splits_merge_strategy[psm_merge_strategy]
+    for psm_dct in psms_dcts:
+        assert len(psms_dct) == len(psms_dcts[0])
 
-
-        merged_psms = functools.reduce(
-            functools.partial(
-                sagepy.core.scoring.merge_psm_dicts,
-                max_hits=search_conf["report_psms"],
-            ),
-            psms,
-        )
-        psm_list = [psm for psms in merged_psms.values() for psm in psms]
-
-    else
-    # from collections import Counter
-    # Counter(map(len, merged_psms.values()))
-    # Counter(map(len, merged_psms2.values()))
-
-    # for psms_dct in psms
-    # Counter(map(sum, zip(*map(lambda psms_dct: map(len, psms_dct.values()), psms)))) == Counter(map(len, merged_psms2.values()))
-
-    # %%timeit
-    merge_lists = lambda lists: list(chain.from_iterable(lists))
-
-    from collections import defaultdict
-    from itertools import chain
-
-    lists = (psms[0]["100205"], psms[1]["100205"], psms[2]["100205"])
-
-    # %%time
-    psm_list2 = list(
-        chain.from_iterable(
-            map(
-                merge_lists_2,
-                zip(*(psm_dct.values() for psm_dct in psms)),
-            )
-        )
-    )
-
-    res2 = {(psm.spec_idx, psm.sequence, psm.sage_feature.charge) for psm in psm_list2}
-    res1 = {(psm.spec_idx, psm.sequence, psm.sage_feature.charge) for psm in psm_list}
-
-    merged_psms2 = dict(
-        zip(
-            psms[0].keys(),
-            map(
-                merge_lists,
-                zip(*(psm_dct.values() for psm_dct in psms)),
-            ),
-        )
-    )
+    psms = DB_splits_merger(psms_dcts) if num_splits > 1 else list(psms_dcts.values())
 
     # OK, we can directly drop to a list.
 
@@ -518,22 +530,22 @@ def sagepy_search(
     # assert len(merged_psms) == len(psms[0])
 
     # TODO: extract and save the SAGE matched peaks???
-    for psm in psm_list:
+    for psm in psms:
         psm.retention_time /= 60.0
 
     if "rescoring" in search_conf:
-        psm_list = create_feature_space(
-            psms=psm_list,
+        psms = create_feature_space(
+            psms=psms,
             **search_conf["rescoring"]["feature_space_settings"],
         )
 
         if "david_teschners_random_combo" in search_conf["rescoring"]["engines"]:
-            psm_list = re_score_psms(
-                psm_list,
+            psms = re_score_psms(
+                psms,
                 **search_conf["rescoring"]["engines"]["david_teschners_random_combo"],
             )
 
-        precursors = psm_collection_to_pandas(psm_list, num_threads=num_threads)
+        precursors = psm_collection_to_pandas(psms, num_threads=num_threads)
 
         # if "mokapot" in search_conf["rescoring"]["engines"]:
         #     psms_moka = mokapot.read_pin(transform_psm_to_mokapot_pin(precursors))
@@ -554,9 +566,9 @@ def sagepy_search(
         #     )
 
         # why is this done I don't know how many times????
-        psm_list = [
+        psms = [
             psm
-            for psm in psm_list
+            for psm in psms
             if psm.rank
             <= search_conf[
                 "report_psms"
@@ -565,19 +577,19 @@ def sagepy_search(
 
     else:
         # why is this done I don't know how many times????
-        psm_list = [
+        psms = [
             psm
-            for psm in psm_list
+            for psm in psms
             if psm.rank
             <= search_conf[
                 "report_psms"
             ]  # top rank == 1, ordered descending with score
         ]
         # assign SAGE q-values
-        assign_sage_spectrum_q(psm_list)
-        assign_sage_peptide_q(psm_list)
-        assign_sage_protein_q(psm_list)
-        precursors = psm_collection_to_pandas(psm_list, num_threads=num_threads)
+        assign_sage_spectrum_q(psms)
+        assign_sage_peptide_q(psms)
+        assign_sage_protein_q(psms)
+        precursors = psm_collection_to_pandas(psms, num_threads=num_threads)
 
     from imspy.timstof.dbsearch.utility import parse_to_tims2rescore
 
@@ -612,8 +624,8 @@ def sagepy_search(
     precursors2.loc[list(map(str, found_in_sagepy_not_sage))]
     precursors2.loc["100588"]
 
-    fragments_df = get_fragments_df(
-        psm_list,
+    fragments_df = psms_to_df(
+        psms,
         fragment_type_as_char=True,  # necessary for downstream procedures.
         verbose=verbose,
     )
@@ -671,6 +683,7 @@ def sagepy_search(
 # Perform FDR filtering
 
 # HERE GOES MAPPING BACK? Does it really????
-# psm = psm_list[0]
+# psm = psms[0]
 # OK, preallocate results of size sum(psm.sage_feature.matched_peaks)
 # likely just need a table like the one from hte new sage.
+s
