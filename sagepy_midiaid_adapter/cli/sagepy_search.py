@@ -3,9 +3,11 @@
 %autoreload 2
 """
 from enum import Enum
+import math
 import functools
 import json
 import os
+import heapq
 from pathlib import Path
 from warnings import warn
 from scipy.interpolate import interp1d
@@ -214,7 +216,8 @@ def replace_short_unimod_with_long_unimod(short_unimod, verbose: False):
     return long_unimod
 
 
-def iter_merged_psms_from_different_searches_recording_target_decoy_collisions(
+
+def iter_merge_psms_per_spectrum(
     psms_in_splits_per_spectrum: Iterable[list[SagepyPsm]],
     use_charges: bool = True,
 ) -> Iterable[tuple[SagepyPsm, bool]]:
@@ -234,35 +237,122 @@ def iter_merged_psms_from_different_searches_recording_target_decoy_collisions(
     """ 
     final_psms = {}
     final_proteins = defaultdict(set)
-    labels = defaultdict(set)
+    key_to_labels = defaultdict(set)
 
     for psm in itertools.chain.from_iterable(psms_in_splits_per_spectrum):
         key = (psm.sequence, psm.sage_feature.charge) if use_charges else psm.sequence
-        final_psms[(key, psm.decoy)] = psm
-        final_proteins[key].update(psm.proteins)        
-        labels.add(psm.decoy)
-
+        labels = key_to_labels[key]
+        if len(labels) < 2:
+            final_psms[(key, psm.decoy)] = psm
+            labels.add(psm.decoy)
+        final_proteins[key].update(psm.proteins)
+        
     for (key, label), psm in final_psms.items():
-        psm.proteins = list(final_proteins[key])
+        labels = key_to_labels[key]
         assert len(labels) > 0
         assert len(labels) <= 2
         detected_collision = len(labels) == 2
-
+        psm.proteins = list(final_proteins[key])
         yield psm, detected_collision
 
 
-target_decoy_collision_to_filter = dict(
-    KEEP_BOTH=lambda psm, detected_collision: True,
-    KEEP_TARGET_DELETE_DECOY=lambda psm, detected_collision: not psm.decoy,
-    DROP_BOTH=lambda psm, detected_collision: not detected_collision,
+def test_iter_merge_psms_per_spectrum():
+    from types import SimpleNamespace as Mock
+
+    psms_in_splits_per_spectrum = (
+        [
+            Mock(decoy=True,  proteins=['a','b'], sequence="ABC", sage_feature = Mock(charge=1)),
+            Mock(decoy=False, proteins=['a','b'], sequence="DE",  sage_feature = Mock(charge=1)),
+            Mock(decoy=True,  proteins=['a','b'], sequence="FG",  sage_feature = Mock(charge=1)),
+        ],
+        [
+            Mock(decoy=True,  proteins=['c','b'], sequence="ABC", sage_feature = Mock(charge=1)),
+            Mock(decoy=False, proteins=['d','b'], sequence="DE",  sage_feature = Mock(charge=1)),
+            Mock(decoy=True,  proteins=['e','b'], sequence="FG",  sage_feature = Mock(charge=1)),
+        ],
+        [
+            Mock(decoy=True,  proteins=['f','b'], sequence="ABC", sage_feature = Mock(charge=1)),
+            Mock(decoy=False, proteins=['g','b'], sequence="DE",  sage_feature = Mock(charge=1)),
+            Mock(decoy=False, proteins=['h','b'], sequence="FG",  sage_feature = Mock(charge=1)),
+        ],
+    )
+    expected_outcomes = (
+        (
+            Mock(
+                decoy=True,
+                proteins=['a','b','c','f'],
+                sequence="ABC",
+                sage_feature = Mock(charge=1)
+            ), 
+            False
+        ),
+        (
+            Mock(
+                decoy=False,
+                proteins=['a','b','d','g'],
+                sequence="DE",
+                sage_feature = Mock(charge=1),
+            ),
+            False
+        ),
+        (
+            Mock(
+                decoy=True,
+                proteins=['a','b','e','h'],
+                sequence="FG",
+                sage_feature = Mock(charge=1),
+            ),
+            True
+        ),
+        (
+            Mock(
+                decoy=False,
+                proteins=['a','b','e','h'],
+                sequence="FG",
+                sage_feature = Mock(charge=1),
+            ),
+            True
+        ),
+    )
+    for (exp_psm, exp_collision), (obs_psm, obs_collision) in zip(
+        expected_outcomes,
+        iter_merge_psms_per_spectrum(
+            psms_in_splits_per_spectrum,
+            use_charges=True,
+        )
+    ):
+        obs_psm.proteins = sorted(obs_psm.proteins)
+        exp_psm.proteins = sorted(exp_psm.proteins)
+        assert exp_psm == obs_psm
+        assert exp_collision == obs_collision
+
+
+
+target_decoy_collision_to_filter: dict[str, Callable[[SagepyPsm,bool], bool]] = dict(
+    KEEP_BOTH=lambda psm, collision: True,
+    KEEP_TARGET_DELETE_DECOY=lambda psm, collision: not psm.decoy,
+    DROP_BOTH=lambda psm, collision: not detected_collision,
 )
 
-def iter_merge_psms(
+
+def get_psm_collision_tuples(top_n_per_spectrum: int | float = math.inf):
+    if top_n_per_spectrum == math.inf:
+        return iter_merge_psms_per_spectrum
+
+    return lambda psms_per_spectrum, use_charges: heapq.nlargest(
+            int(top_n_per_spectrum),
+            iter_merge_psms_per_spectrum(psms_per_spectrum, use_charges),
+            key=lambda x:x[0].hyperscore,
+        )
+    
+
+def matteos_happy_merge(
     psms_dcts: list[dict[str, list[SagepyPsm]]],
     use_charges: bool=True,
     collision_decision: str="KEEP_BOTH", # "keep target", "drop both"
-) -> Iterable[tuple[SagepyPsm, bool]]:
-    """Iterate merged PSMs per spectrum from different DB splits while detecting collisions.
+    top_n_per_spectrum: int | float = math.inf,
+) -> tuple[list[SagepyPsm], list[bool]]:
+    """Get merged PSMs per spectrum from different DB splits while detecting collisions.
 
     This procedure can report 2 peptides with the same sequence (or sequence and charge) that could originate from both a target or decoy sequence.
     
@@ -277,194 +367,28 @@ def iter_merge_psms(
         tuple[SagepyPsm, bool]: A PSM with protein sources adjusted for origins from different splits and info of whether it colides with some other peptide in a target-decoy collision.
     """ 
     assert collision_decision in target_decoy_collision_to_filter, f"Provide collision_decision from {list(target_decoy_collision_to_filter)}."
+    
     psm_filter = target_decoy_collision_to_filter[collision_decision]
-    yield from itertools.chain.from_iterable(
-        (
-            filter(psm_filter, spectrum_psms_merger(psms_per_spectrum, use_charges))
-            for psms_per_spectrum in zip(
-                *(psm_dct.values() for psm_dct in psms_dcts)
-            )
-        )
-    )
+    psm_collision_tuples = get_psm_collision_tuples(top_n_per_spectrum)
+
+    psms = []
+    target_decoy_collisions = []
+    for psms_per_spectrum in zip(*(psm_dct.values() for psm_dct in psms_dcts)):
+        for psm, collision in psm_collision_tuples(psms_per_spectrum, use_charges):
+            if psm_filter(psm, collision):
+                psms.append(psm)
+                target_decoy_collisions.append(collision)
+
+    return psms, target_decoy_collisions
 
 
-def iter_merge_psms(
-    spectrum_psms_merger: Iterator[list[SagepyPsm]],
-) -> Callable[[list[dict[str, list[SagepyPsm]]], ...], list[SagepyPsm]]:
-    @functools.wraps(spectrum_psms_merger)
-    def wrapper(psms_dcts, *args, **kwargs):
-        return list(
-            itertools.chain.from_iterable(
-                (
-                    spectrum_psms_merger(psms_per_spectrum, *args, **kwargs)
-                    for psms_per_spectrum in zip(
-                        *(psm_dct.values() for psm_dct in psms_dcts)
-                    )
-                )
-            )
-        )
-
-    return wrapper
-
-
-iter_merge_psms_from_different_searches_keeping_targets_during_decoy_target_collisions = filter(
-    lambda psm, detected_collision: not psm.decoy,
-    iter_merge_psms_from_different_searches_neglecting_collisions,
-)
-
-def iter_merge_psms_from_different_searches_keeping_targets_during_decoy_target_collisions(
-    psms_in_splits_per_spectrum: Iterable[list[SagepyPsm]],
-    use_charges: bool = True,
-    *args,
-    **kwargs,
-) -> Iterable[tuple[SagepyPsm,bool]]:
-    for psm, detected_collision in iter_merge_psms_from_different_searches_neglecting_collisions(psms_in_splits_per_spectrum, )
-
-    match collision_decision:
-        case TargetDecoyClashDecision.KEEP_BOTH:
-            yield psm, detected_collision
-        case TargetDecoyClashDecision.KEEP_TARGET_DELETE_DECOY:
-            if not psm.decoy:
-
-
-
-def iter_merge_split_searches_dropping_target_decoy_collisions(
-    psms_in_splits_per_spectrum: Iterable[list[SagepyPsm]],
-    use_charges: bool = True,
-    *args,
-    **kwargs,
-) -> Iterable[SagepyPsm]:
-    """Iterate PSMs from different DB splits.
-
-    This procedure drops psms that have both a decoy and a target parent.
-
-    WARNING: we assume that fasta is split so that different splits do not contain the same protein header.
-
-    Arguments:
-        psms_in_splits_per_spectrum (Iterable of lists of SagepyPsms): Psms to merge. WARNING!!! TO BE CALLED ON THE SAME SPECTRUM PSMS.
-        use_charges (bool): Merge by modified sequence and charge as criterion. When False, only by modified sequence.
-        *args, **kwargs: No influence.
-
-    Yields:
-        tuple[SagepyPsm, bool]: tuple[SagepyPsm, bool]: A PSM with protein sources adjusted for origins from different splits and info of whether it colides with some other peptide in a target-decoy collision.
-    """
-
-
-
-
-
-def iter_merge_split_searches_dropping_target_decoy_collisions(
-    psms_in_splits_per_spectrum: Iterable[list[SagepyPsm]],
-    use_charges: bool = True,
-    collision_stats: dict = {},
-    *args,
-    **kwargs,
-) -> Iterable[SagepyPsm]:
-    """Iterate PSMs from different DB splits.
-
-    This procedure drops psms that have both a decoy and a target parent.
-
-    WARNING: we assume that fasta is split so that different splits do not contain the same protein header.
-
-    Arguments:
-        psms_in_splits_per_spectrum (Iterable of lists of SagepyPsms): Psms to merge. WARNING!!! TO BE CALLED ON THE SAME SPECTRUM PSMS.
-        use_charges (bool): Merge by modified sequence and charge as criterion. When False, only by modified sequence.
-        *args, **kwargs: No influence.
-
-    Yields:
-        SagepyPsm: A PSM with protein sources adjusted for origins from different splits.
-    """
-    DELETE_ME = -1
-    FIRST_TIME_FOUND = 0
-
-    key_to_psm_repr = {}
-    key_to_proteins = defaultdict(set)
-    for psm in itertools.chain.from_iterable(psms_in_splits_per_spectrum):
-        key = (psm.sequence, psm.sage_feature.charge) if use_charges else psm.sequence
-
-        psm_repr = key_to_psm_repr.get(key, FIRST_TIME_FOUND)
-
-        if psm_repr == DELETE_ME:  # already found decoy-target pair
-            continue
-        elif psm_repr == FIRST_TIME_FOUND:
-            key_to_psm_repr[key] = psm
-            key_to_proteins[key].update(psm.proteins)
-        elif psm_repr.decoy == psm.decoy:  # only decoys OK or only targets OK
-            key_to_proteins[key].update(psm.proteins)
-        else:  # one psm is a decoy , another a target: collision to drop
-            key_to_psm_repr[key] = DELETE_ME
-
-    for key, psm in key_to_psm_repr.items():
-        if psm != DELETE_ME:
-            psm.proteins = list(key_to_proteins[key])
-            yield psm
-        else:
-            collision_stats["collision_cnt"] += 1
-
-
-def iter_merge_split_searches_retaining_targets_in_target_decoy_collisions(
-    psms_in_splits_per_spectrum: Iterable[list[SagepyPsm]],
-    use_charges: bool = True,
-    *args,
-    **kwargs,
-) -> Iterator[SagepyPsm]:
-    """Iterate PSMs from different DB splits.
-
-    WARNING: we assume that fasta is split so that different splits do not contain the same protein header.
-
-    Arguments:
-        psms_in_splits_per_spectrum (Iterable of lists of SagepyPsms): Psms to merge. WARNING!!! TO BE CALLED ON THE SAME SPECTRUM PSMS.
-        use_charges (bool): Merge by modified sequence and charge as criterion. When False, only by modified sequence.
-        *args, **kwargs: No influence.
-
-    Yields:
-        SagepyPsm: A PSM with protein sources adjusted for origins from different splits.
-    """
-    FIRST_TIME_FOUND = 0
-
-    ion_to_psm_repr = {}
-    for psm in itertools.chain.from_iterable(psms_in_splits_per_spectrum):
-        ion = (psm.sequence, psm.sage_feature.charge) if use_charges else psm.sequence
-
-        psm_repr = ion_to_psm_repr.get(ion, FIRST_TIME_FOUND)
-
-        if psm_repr == FIRST_TIME_FOUND:
-            ion_to_psm_repr[ion] = psm
-        elif psm_repr.decoy == psm.decoy:  # only decoys OK or only targets OK
-            psm_repr.proteins.extend(psm.proteins)
-            # as different chunks get different proteins.
-            # psm_repr.proteins is a list: in place modification
-        elif psm_repr.decoy and not psm.decoy:
-            ion_to_psm_repr[ion] = psm
-
-    yield from ion_to_psm_repr.values()
-
-
-def iter_merge_psms(
-    spectrum_psms_merger: Iterator[list[SagepyPsm]],
-) -> Callable[[list[dict[str, list[SagepyPsm]]], ...], list[SagepyPsm]]:
-    @functools.wraps(spectrum_psms_merger)
-    def wrapper(psms_dcts, *args, **kwargs):
-        return list(
-            itertools.chain.from_iterable(
-                (
-                    spectrum_psms_merger(psms_per_spectrum, *args, **kwargs)
-                    for psms_per_spectrum in zip(
-                        *(psm_dct.values() for psm_dct in psms_dcts)
-                    )
-                )
-            )
-        )
-
-    return wrapper
-
-
+ 
 def david_teschner_happy_merge(
     psms_in_splits_per_spectrum: Iterable[list[SagepyPsm]],
     max_hits: int=25,
     *args,
     **kwargs,
-) -> list[SagepyPsm]:
+) -> tuple[list[SagepyPsm], list]:
     merged_psms = functools.reduce(
         functools.partial(
             sagepy.core.scoring.merge_psm_dicts,
@@ -473,18 +397,15 @@ def david_teschner_happy_merge(
         psms_in_splits_per_spectrum,
     )
     psms = [psm for psms in merged_psms.values() for psm in psms]
-    return psms
+    target_decoy_collisions = []
+    return psms, target_decoy_collisions
+
 
 
 DB_splits_mergers: dict[
-    str, Callable[Iterable[list[SagepyPsm]], list[SagepyPsm]]
+    str, Callable[Iterable[list[SagepyPsm]], tuple[list[SagepyPsm], list]]
 ] = dict(
-    drop_target_decoy_collisions=iter_merge_psms(
-        iter_merge_split_searches_dropping_target_decoy_collisions
-    ),
-    retain_targets_if_colliding_with_decoys=iter_merge_psms(
-        iter_merge_split_searches_retaining_targets_in_target_decoy_collisions
-    ),
+    matteos_happy_merge=matteos_happy_merge,
     david_teschner_happy_merge=david_teschner_happy_merge,
 )
 
@@ -585,8 +506,9 @@ def sagepy_search(
     if num_splits > 1:
         try:
             DB_splits_merger = DB_splits_mergers[
-                search_conf.get("psm_merge_strategy", "drop_target_decoy_collisions")
+                search_conf.get("psm_merge_strategy", "matteos_happy_merge")
             ]
+            DB_splits_merger_kwargs = search_conf.get("psm_merge_strategy_kwargs", {})
         except KeyError as exc:
             raise KeyError(
                 f"Currently supported DB splits merge strategies include: {list(DB_splits_mergers)}. You passed in `{exc}`."
@@ -659,7 +581,7 @@ def sagepy_search(
         assert max(Counter(map(len, psms_dct.values()))) <= scorer_kwargs["report_psms"]
 
     %%time
-    psms = DB_splits_merger(psms_dcts, use_charges=False) if num_splits > 1 else list(psms_dcts.values())
+    psms = DB_splits_merger(psms_dcts, **DB_splits_merger_kwargs) if num_splits > 1 else list(psms_dcts.values())
 
     %%time
     psms_david = DB_splits_mergers["david_teschner_happy_merge"](psms_dcts, max_hits=1)
