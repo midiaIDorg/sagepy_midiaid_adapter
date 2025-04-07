@@ -20,6 +20,7 @@ dependencies = [
     "pandas_ops",
     "sagepy",
     "sagepy_connector",
+    "toml",
 ]
 
 [tool.setuptools]

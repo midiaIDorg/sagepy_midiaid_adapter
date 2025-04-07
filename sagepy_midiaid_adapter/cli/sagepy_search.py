@@ -2,16 +2,18 @@
 %load_ext autoreload
 %autoreload 2
 """
-from enum import Enum
+import duckdb
 import math
 import functools
 import json
 import os
 import heapq
+import toml
 from pathlib import Path
 from warnings import warn
 from scipy.interpolate import interp1d
 from collections import defaultdict
+from collections import Counter
 import itertools
 
 import click
@@ -32,6 +34,7 @@ from sagepy.qfdr.tdc import (
     assign_sage_spectrum_q,
     target_decoy_competition_pandas,
 )
+from sagepy.rescore.rescore import rescore_psms
 from sagepy.rescore.utility import transform_psm_to_mokapot_pin, get_features
 from sagepy.utility import generate_search_configurations, psm_collection_to_pandas
 from sagepy.core.scoring import ScoreType
@@ -39,6 +42,7 @@ from tqdm import tqdm
 from opentimspy import OpenTIMS
 from pandas_ops.io import add_kwargs
 from sagepy.core.scoring import Psm as SagepyPsm
+from pandas_ops.io import save_df
 import typing
 from typing import Callable
 from typing import Iterable
@@ -62,11 +66,11 @@ def sanitize_search_config(
         warn(msg)
     else:
         if (
-            "rescoring" in search_conf
+            "feature_prediction" in search_conf
             and search_conf["database"]["enzyme"]["max_len"]
             > _MAX_PEP_LEN_FOR_INTENSITY_PREDICTION
         ):
-            msg = f"You are doing rescoring and it must use fragment relative intensity prediction. The default fragment predictor cannot predict fragment intensities of fragments larger than {_MAX_PEP_LEN_FOR_INTENSITY_PREDICTION} amino acids long. Clipping your choice of `{search_conf['database']['enzyme']['max_len']}` to {_MAX_PEP_LEN_FOR_INTENSITY_PREDICTION}."
+            msg = f"You decided for prediction and it encompassed (for now) fragment relative intensity prediction. The default fragment predictor cannot predict fragment intensities of fragments larger than {_MAX_PEP_LEN_FOR_INTENSITY_PREDICTION} amino acids long. Clipping your choice of `{search_conf['database']['enzyme']['max_len']}` to {_MAX_PEP_LEN_FOR_INTENSITY_PREDICTION}."
             warn(msg)
             search_conf["database"]["enzyme"][
                 "max_len"
@@ -76,10 +80,10 @@ def sanitize_search_config(
         search_conf.get("report_psms", -1) > 0
     ), "You either did not pass `report_psms` or passed in `report_psms<0`. The number of psms should be at least set to 1, and it is suggested to pass in more than 1 for rescoring. But who believes rescoring without theory? Ils sont foux, lex experimentalistes..."
 
-    if "rescoring" in search_conf:
+    if "feature_prediction" in search_conf:
         if search_conf["report_psms"] == 1:
             warn(
-                "You have passed in `report_psms = 1` in your config and you want rescoring even though there IS NO MATHEMATICAL THEORY BEHIND ITS INFLUENCE ON FDR CALCULATIONS (SHAME!!! SHAME!!! SHAME!!!). Wise people in the field suggest using rescoring with more than 1 psm for rescoring, as if they had any idea how to prove that. Biology will go away. Math will stay."
+                "You have passed in `report_psms = 1` in your config and you want to predict feature that can typically be used in rescoring even though there IS NO MATHEMATICAL THEORY BEHIND ITS INFLUENCE ON FDR CALCULATIONS (SHAME!!! SHAME!!! SHAME!!!). Wise people in the field suggest using rescoring with more than 1 psm for rescoring, as if they had any idea how to prove that. Biology will go away. Math will stay."
             )
 
     search_conf["database"]["static_mods"] = {
@@ -216,7 +220,6 @@ def replace_short_unimod_with_long_unimod(short_unimod, verbose: False):
     return long_unimod
 
 
-
 def iter_merge_psms_per_spectrum(
     psms_in_splits_per_spectrum: Iterable[list[SagepyPsm]],
     use_charges: bool = True,
@@ -224,7 +227,7 @@ def iter_merge_psms_per_spectrum(
     """Iterate merged PSMs per spectrum from different DB splits while detecting collisions.
 
     This procedure can report 2 peptides with the same sequence (or sequence and charge) that could originate from both a target or decoy sequence.
-    
+
     WARNING: we assume that fasta is split so that different splits do not contain the same protein header.
 
     Arguments:
@@ -234,7 +237,7 @@ def iter_merge_psms_per_spectrum(
 
     Yields:
         tuple[SagepyPsm, bool]: A PSM with protein sources adjusted for origins from different splits and info of whether it colides with some other peptide in a target-decoy collision.
-    """ 
+    """
     final_psms = {}
     final_proteins = defaultdict(set)
     key_to_labels = defaultdict(set)
@@ -246,7 +249,7 @@ def iter_merge_psms_per_spectrum(
             final_psms[(key, psm.decoy)] = psm
             labels.add(psm.decoy)
         final_proteins[key].update(psm.proteins)
-        
+
     for (key, label), psm in final_psms.items():
         labels = key_to_labels[key]
         assert len(labels) > 0
@@ -261,57 +264,102 @@ def test_iter_merge_psms_per_spectrum():
 
     psms_in_splits_per_spectrum = (
         [
-            Mock(decoy=True,  proteins=['a','b'], sequence="ABC", sage_feature = Mock(charge=1)),
-            Mock(decoy=False, proteins=['a','b'], sequence="DE",  sage_feature = Mock(charge=1)),
-            Mock(decoy=True,  proteins=['a','b'], sequence="FG",  sage_feature = Mock(charge=1)),
+            Mock(
+                decoy=True,
+                proteins=["a", "b"],
+                sequence="ABC",
+                sage_feature=Mock(charge=1),
+            ),
+            Mock(
+                decoy=False,
+                proteins=["a", "b"],
+                sequence="DE",
+                sage_feature=Mock(charge=1),
+            ),
+            Mock(
+                decoy=True,
+                proteins=["a", "b"],
+                sequence="FG",
+                sage_feature=Mock(charge=1),
+            ),
         ],
         [
-            Mock(decoy=True,  proteins=['c','b'], sequence="ABC", sage_feature = Mock(charge=1)),
-            Mock(decoy=False, proteins=['d','b'], sequence="DE",  sage_feature = Mock(charge=1)),
-            Mock(decoy=True,  proteins=['e','b'], sequence="FG",  sage_feature = Mock(charge=1)),
+            Mock(
+                decoy=True,
+                proteins=["c", "b"],
+                sequence="ABC",
+                sage_feature=Mock(charge=1),
+            ),
+            Mock(
+                decoy=False,
+                proteins=["d", "b"],
+                sequence="DE",
+                sage_feature=Mock(charge=1),
+            ),
+            Mock(
+                decoy=True,
+                proteins=["e", "b"],
+                sequence="FG",
+                sage_feature=Mock(charge=1),
+            ),
         ],
         [
-            Mock(decoy=True,  proteins=['f','b'], sequence="ABC", sage_feature = Mock(charge=1)),
-            Mock(decoy=False, proteins=['g','b'], sequence="DE",  sage_feature = Mock(charge=1)),
-            Mock(decoy=False, proteins=['h','b'], sequence="FG",  sage_feature = Mock(charge=1)),
+            Mock(
+                decoy=True,
+                proteins=["f", "b"],
+                sequence="ABC",
+                sage_feature=Mock(charge=1),
+            ),
+            Mock(
+                decoy=False,
+                proteins=["g", "b"],
+                sequence="DE",
+                sage_feature=Mock(charge=1),
+            ),
+            Mock(
+                decoy=False,
+                proteins=["h", "b"],
+                sequence="FG",
+                sage_feature=Mock(charge=1),
+            ),
         ],
     )
     expected_outcomes = (
         (
             Mock(
                 decoy=True,
-                proteins=['a','b','c','f'],
+                proteins=["a", "b", "c", "f"],
                 sequence="ABC",
-                sage_feature = Mock(charge=1)
-            ), 
-            False
+                sage_feature=Mock(charge=1),
+            ),
+            False,
         ),
         (
             Mock(
                 decoy=False,
-                proteins=['a','b','d','g'],
+                proteins=["a", "b", "d", "g"],
                 sequence="DE",
-                sage_feature = Mock(charge=1),
+                sage_feature=Mock(charge=1),
             ),
-            False
+            False,
         ),
         (
             Mock(
                 decoy=True,
-                proteins=['a','b','e','h'],
+                proteins=["a", "b", "e", "h"],
                 sequence="FG",
-                sage_feature = Mock(charge=1),
+                sage_feature=Mock(charge=1),
             ),
-            True
+            True,
         ),
         (
             Mock(
                 decoy=False,
-                proteins=['a','b','e','h'],
+                proteins=["a", "b", "e", "h"],
                 sequence="FG",
-                sage_feature = Mock(charge=1),
+                sage_feature=Mock(charge=1),
             ),
-            True
+            True,
         ),
     )
     for (exp_psm, exp_collision), (obs_psm, obs_collision) in zip(
@@ -319,7 +367,7 @@ def test_iter_merge_psms_per_spectrum():
         iter_merge_psms_per_spectrum(
             psms_in_splits_per_spectrum,
             use_charges=True,
-        )
+        ),
     ):
         obs_psm.proteins = sorted(obs_psm.proteins)
         exp_psm.proteins = sorted(exp_psm.proteins)
@@ -327,8 +375,7 @@ def test_iter_merge_psms_per_spectrum():
         assert exp_collision == obs_collision
 
 
-
-target_decoy_collision_to_filter: dict[str, Callable[[SagepyPsm,bool], bool]] = dict(
+target_decoy_collision_to_filter: dict[str, Callable[[SagepyPsm, bool], bool]] = dict(
     KEEP_BOTH=lambda psm, collision: True,
     KEEP_TARGET_DELETE_DECOY=lambda psm, collision: not psm.decoy,
     DROP_BOTH=lambda psm, collision: not detected_collision,
@@ -340,22 +387,22 @@ def get_psm_collision_tuples(top_n_per_spectrum: int | float = math.inf):
         return iter_merge_psms_per_spectrum
 
     return lambda psms_per_spectrum, use_charges: heapq.nlargest(
-            int(top_n_per_spectrum),
-            iter_merge_psms_per_spectrum(psms_per_spectrum, use_charges),
-            key=lambda x:x[0].hyperscore,
-        )
-    
+        int(top_n_per_spectrum),
+        iter_merge_psms_per_spectrum(psms_per_spectrum, use_charges),
+        key=lambda x: x[0].hyperscore,
+    )
+
 
 def matteos_happy_merge(
     psms_dcts: list[dict[str, list[SagepyPsm]]],
-    use_charges: bool=True,
-    collision_decision: str="KEEP_BOTH", # "keep target", "drop both"
+    use_charges: bool = True,
+    collision_decision: str = "KEEP_BOTH",  # "keep target", "drop both"
     top_n_per_spectrum: int | float = math.inf,
 ) -> tuple[list[SagepyPsm], list[bool]]:
     """Get merged PSMs per spectrum from different DB splits while detecting collisions.
 
     This procedure can report 2 peptides with the same sequence (or sequence and charge) that could originate from both a target or decoy sequence.
-    
+
     WARNING: we assume that fasta is split so that different splits do not contain the same protein header.
 
     Arguments:
@@ -365,9 +412,11 @@ def matteos_happy_merge(
 
     Yields:
         tuple[SagepyPsm, bool]: A PSM with protein sources adjusted for origins from different splits and info of whether it colides with some other peptide in a target-decoy collision.
-    """ 
-    assert collision_decision in target_decoy_collision_to_filter, f"Provide collision_decision from {list(target_decoy_collision_to_filter)}."
-    
+    """
+    assert (
+        collision_decision in target_decoy_collision_to_filter
+    ), f"Provide collision_decision from {list(target_decoy_collision_to_filter)}."
+
     psm_filter = target_decoy_collision_to_filter[collision_decision]
     psm_collision_tuples = get_psm_collision_tuples(top_n_per_spectrum)
 
@@ -382,17 +431,16 @@ def matteos_happy_merge(
     return psms, target_decoy_collisions
 
 
- 
-def david_teschner_happy_merge(
+def davids_happy_merge(
     psms_in_splits_per_spectrum: Iterable[list[SagepyPsm]],
-    max_hits: int=25,
+    top_n_per_spectrum: int = 1000,
     *args,
     **kwargs,
 ) -> tuple[list[SagepyPsm], list]:
     merged_psms = functools.reduce(
         functools.partial(
             sagepy.core.scoring.merge_psm_dicts,
-            max_hits=max_hits,
+            max_hits=top_n_per_spectrum,
         ),
         psms_in_splits_per_spectrum,
     )
@@ -401,13 +449,9 @@ def david_teschner_happy_merge(
     return psms, target_decoy_collisions
 
 
-
 DB_splits_mergers: dict[
     str, Callable[Iterable[list[SagepyPsm]], tuple[list[SagepyPsm], list]]
-] = dict(
-    matteos_happy_merge=matteos_happy_merge,
-    david_teschner_happy_merge=david_teschner_happy_merge,
-)
+] = dict(matteos_happy_merge=matteos_happy_merge, davids_happy_merge=davids_happy_merge)
 
 
 def psms_to_df(
@@ -500,23 +544,25 @@ def sagepy_search(
     num_threads = min(num_threads, cores_cnt)
 
     with open(search_config, "r") as f:
-        search_conf = sanitize_search_config(json.load(f))
+        search_conf = sanitize_search_config(
+            json.load(f) if search_config.suffix == ".json" else toml.load(f)
+        )
     scorer_kwargs = sanitized_search_config_to_scorer_kwargs(search_conf)
 
-    if num_splits > 1:
-        try:
-            DB_splits_merger = DB_splits_mergers[
-                search_conf.get("psm_merge_strategy", "matteos_happy_merge")
-            ]
-            DB_splits_merger_kwargs = search_conf.get("psm_merge_strategy_kwargs", {})
-        except KeyError as exc:
-            raise KeyError(
-                f"Currently supported DB splits merge strategies include: {list(DB_splits_mergers)}. You passed in `{exc}`."
-            ) from exc
+    try:
+        DB_splits_merger = DB_splits_mergers[
+            search_conf.get("psm_merge_strategy", "matteos_happy_merge")
+        ]
+        DB_splits_merger_kwargs = search_conf.get("psm_merge_strategy_kwargs", {})
+    except KeyError as exc:
+        raise KeyError(
+            f"Currently supported DB splits merge strategies include: {list(DB_splits_mergers)}. You passed in `{exc}`."
+        ) from exc
 
     if not search_conf["deisotope"]:
         warn("Are you sure you do not want SAGEPY to run deisotoping?")
 
+    dbconn = duckdb.connect()
     DiaFrameMsMsWindows = pd.DataFrame(
         OpenTIMS(dataset).table2dict("DiaFrameMsMsWindows")
     )
@@ -545,6 +591,7 @@ def sagepy_search(
     fragment_stats["intensity"] = fragment_stats["intensity"].astype(np.float32)
     fragment_stats["mz_wmean"] = fragment_stats["mz_wmean"].astype(np.float32)
     edges = read_df(edges)
+    stats = {}
 
     spec_processor = SpectrumProcessor(
         take_top_n=search_conf.get("max_peaks", 1000),
@@ -572,131 +619,47 @@ def sagepy_search(
     if verbose:
         dbs = tqdm(dbs, total=num_splits, desc="Searching database.")
 
-    psms_dcts: list[dict[str, list[SagepyPsm]]] = [
+    psms_dcts: list[  # different fasta split results stored here as dicts
+        dict[
+            str,  # spec_idx: spectrum identification.
+            list[SagepyPsm],  # psms per spectrum
+        ]
+    ] = [
         scorer.score_collection_psm(db, queries, num_threads=num_threads) for db in dbs
-    ]  # str = spec_idx
+    ]
 
     for psms_dct in psms_dcts:
         assert len(psms_dct) == len(psms_dcts[0])
         assert max(Counter(map(len, psms_dct.values()))) <= scorer_kwargs["report_psms"]
 
-    %%time
-    psms = DB_splits_merger(psms_dcts, **DB_splits_merger_kwargs) if num_splits > 1 else list(psms_dcts.values())
+    psms, target_decoy_collisions = (
+        DB_splits_merger(psms_dcts, **DB_splits_merger_kwargs)
+        if num_splits > 1
+        else list(psms_dcts.values())
+    )
 
-    %%time
-    psms_david = DB_splits_mergers["david_teschner_happy_merge"](psms_dcts, max_hits=1)
+    target_decoy_collisions_stats = Counter(target_decoy_collisions)
+    stats["TARGET_DECOY_COLLISION_CNT"] = target_decoy_collisions_stats[True]
+    stats["PSMS_WITHOUT_COLLISION_CNT"] = target_decoy_collisions_stats[False]
 
-    from collections import Counter
-    matteo = Counter((psm.spec_idx, psm.sequence) for psm in psms)
-    matteo = Counter(psm.spec_idx for psm in psms)
-    david = Counter((psm.spec_idx, psm.sequence) for psm in psms_david)
-    david = Counter(psm.spec_idx for psm in psms_david)
-
-    
-    Counter(matteo.values())
-    Counter(david.values())
-
-    for psm in psms:
-        if "[" in psm.sequence:
-            print(psm)
-            break
-
-    venny_cnt(matteo, david)
-    len(list(matteo))
-    len(list(david))
-    matteo == david
-    # OK, we can directly drop to a list.
-
-    # for A, B in zip(zip(psms[0].values(), psms[1].values(), psms[2].values()), zip(*(psm_dct.values() for psm_dct in psms))):
-    #     assert A==B
-
-    # len(psms[0]["100185"])
-    # len(psms[1]["100185"])
-    # len(psms[2]["100185"])
-
-    # sorted([psm.peptide_idx for psm in merged_psms["100185"]])
-    # sorted([psm.peptide_idx for psm in merged_psms2["100185"]])
-
-    # [len(psms_dct["100184"]) for psms_dct in psms]
-    # len(merged_psms["100184"])
-    # len(merged_psms2["100184"])
-
-    # assert len(merged_psms) == len(psms[0])
-
-    # TODO: extract and save the SAGE matched peaks???
     for psm in psms:
         psm.retention_time /= 60.0
 
     if "rescoring" in search_conf:
+        # this needs to be extended / replaced by some function that gets midia specific
+        # features
         psms = create_feature_space(
             psms=psms,
+            verbose=verbose,
             **search_conf["rescoring"]["feature_space_settings"],
         )
 
-        if "david_teschners_random_combo" in search_conf["rescoring"]["engines"]:
-            psms = re_score_psms(
-                psms,
-                **search_conf["rescoring"]["engines"]["david_teschners_random_combo"],
-            )
+    # SAGE operations directly exposed via SAGEPY
+    assign_sage_spectrum_q(psms)
+    assign_sage_peptide_q(psms)
+    assign_sage_protein_q(psms)
 
-        precursors = psm_collection_to_pandas(psms, num_threads=num_threads)
-
-        # if "mokapot" in search_conf["rescoring"]["engines"]:
-        #     psms_moka = mokapot.read_pin(transform_psm_to_mokapot_pin(precursors))
-        #     results, _ = mokapot.brew(psms_moka, **)
-
-        #     if "seed" in search_conf["rescoring"]["engines"]["mokapot"]:
-        #         mokapot_kwargs["rng"] = search_conf["rescoring_engines"]["mokapot"][
-        #             "seed"
-        #         ]
-
-        #     precursors["spec_idx"] = precursors["spec_idx"].astype(int)
-        #     precursors = precursors.merge(
-        #         results.psms,
-        #         how="left",
-        #         left_on="spec_idx",
-        #         right_on="SpecId",
-        #         suffixes=("", "_mokapot"),
-        #     )
-
-        # why is this done I don't know how many times????
-        psms = [
-            psm
-            for psm in psms
-            if psm.rank
-            <= search_conf[
-                "report_psms"
-            ]  # top rank == 1, ordered descending with score
-        ]
-
-    else:
-        # why is this done I don't know how many times????
-        psms = [
-            psm
-            for psm in psms
-            if psm.rank
-            <= search_conf[
-                "report_psms"
-            ]  # top rank == 1, ordered descending with score
-        ]
-        # assign SAGE q-values
-        assign_sage_spectrum_q(psms)
-        assign_sage_peptide_q(psms)
-        assign_sage_protein_q(psms)
-        precursors = psm_collection_to_pandas(psms, num_threads=num_threads)
-
-    from imspy.timstof.dbsearch.utility import parse_to_tims2rescore
-
-    # you can also use double competition to get the q-values CREMA style
-    TDC_pandas = target_decoy_competition_pandas(
-        precursors, method="peptide_psm_peptide", score="hyperscore"
-    )
-
-    # parse_to_tims2rescore(precursors)
-
-    from pandas_ops.io import save_df
-
-    save_df(precursors, "F9477_1psm.parquet")
+    precursors: pd.DataFrame = psm_collection_to_pandas(psms, num_threads=num_threads)
 
     precursors = precursors.reset_index()
     precursors = precursors.rename(
@@ -731,10 +694,20 @@ def sagepy_search(
     submitted = [int(q.id) for q in queries]
     venny_cnt(sageprec.MS1_ClusterID, submitted)
 
-    print(TDC_pandas)
+    save_df(precursors, "F9477_1psm.parquet")
     # fragment_cluster_stats
     # results_sage_parquet
 
+
+# psms = [
+#     psm
+#     for psm in psms
+#     if psm.rank
+#     <= search_conf[
+#         "report_psms"
+#     ]  # top rank == 1, ordered descending with score
+# ]
+# assign SAGE q-values
 
 # this is done in get_features`
 # X, Y = get_features(
@@ -780,4 +753,39 @@ def sagepy_search(
 # psm = psms[0]
 # OK, preallocate results of size sum(psm.sage_feature.matched_peaks)
 # likely just need a table like the one from hte new sage.
-s
+
+
+# if "david_teschners_random_combo" in search_conf["rescoring"]["engines"]:
+#     psms = re_score_psms(
+#         psms,
+#         **search_conf["rescoring"]["engines"]["david_teschners_random_combo"],
+#     )
+
+# if "mokapot" in search_conf["rescoring"]["engines"]:
+#     psms_moka = mokapot.read_pin(transform_psm_to_mokapot_pin(precursors))
+#     results, _ = mokapot.brew(psms_moka, **)
+
+#     if "seed" in search_conf["rescoring"]["engines"]["mokapot"]:
+#         mokapot_kwargs["rng"] = search_conf["rescoring_engines"]["mokapot"][
+#             "seed"
+#         ]
+
+#     precursors["spec_idx"] = precursors["spec_idx"].astype(int)
+#     precursors = precursors.merge(
+#         results.psms,
+#         how="left",
+#         left_on="spec_idx",
+#         right_on="SpecId",
+#         suffixes=("", "_mokapot"),
+#     )
+# why is this done I don't know how many times????
+# precursors = psm_collection_to_pandas(psms, num_threads=num_threads)
+
+# from imspy.timstof.dbsearch.utility import parse_to_tims2rescore
+
+# you can also use double competition to get the q-values CREMA style
+# TDC_pandas = target_decoy_competition_pandas(
+#     precursors, method="peptide_psm_peptide", score="hyperscore"
+# )
+
+# parse_to_tims2rescore(precursors)
