@@ -49,6 +49,7 @@ from typing import Callable
 from typing import Iterable
 from typing import Iterator
 
+
 pd.set_option("display.max_columns", None)
 pd.set_option("display.max_rows", 4)
 
@@ -701,12 +702,9 @@ def sagepy_search(
         assert max(Counter(map(len, psms_dct.values()))) <= scorer_kwargs["report_psms"]
 
     # this could be done faster after all.
-    psms, target_decoy_collisions = (
-        DB_splits_merger(psms_dcts, **DB_splits_merger_kwargs)
-        if num_splits > 1
-        else list(psms_dcts.values())
+    psms, target_decoy_collisions = DB_splits_merger(
+        psms_dcts, **DB_splits_merger_kwargs
     )
-
     target_decoy_collisions_stats = Counter(target_decoy_collisions)
     stats["TARGET_DECOY_COLLISION_CNT"] = target_decoy_collisions_stats[True]
     stats["PSMS_WITHOUT_COLLISION_CNT"] = target_decoy_collisions_stats[False]
