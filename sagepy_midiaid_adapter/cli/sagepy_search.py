@@ -700,6 +700,7 @@ def sagepy_search(
         assert len(psms_dct) == len(psms_dcts[0])
         assert max(Counter(map(len, psms_dct.values()))) <= scorer_kwargs["report_psms"]
 
+    # this could be done faster after all.
     psms, target_decoy_collisions = (
         DB_splits_merger(psms_dcts, **DB_splits_merger_kwargs)
         if num_splits > 1
