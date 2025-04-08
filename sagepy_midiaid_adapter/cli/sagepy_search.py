@@ -459,7 +459,7 @@ DB_splits_mergers: dict[
 def adjust_precursors_to_match_SAGE_naming_and_types(
     precursors: pd.DataFrame,
     precursor_stats: pd.DataFrame,
-) -> None:
+) -> pd.DataFrame:
     """
     Adjust names and values to have
     """
@@ -492,13 +492,6 @@ def adjust_precursors_to_match_SAGE_naming_and_types(
         precursors.MS1_ClusterID
     ].to_numpy() / 60.0
 
-    plt.scatter(
-        precursor_stats.retention_time_wmean.iloc[precursors.MS1_ClusterID].to_numpy()
-        / 60.0,
-        precursors.predicted_rt - precursors.delta_rt_model,
-    )
-    plt.show()
-
     precursors.matched_peaks = precursors.matched_peaks.astype(np.int64)
     precursors.longest_b = precursors.longest_b.astype(np.int64)
     precursors.longest_y = precursors.longest_y.astype(np.int64)
@@ -511,6 +504,7 @@ def adjust_precursors_to_match_SAGE_naming_and_types(
     precursors["predicted_mobility"] = (
         precursors["ion_mobility"] - precursors.delta_mobility
     )
+    return precursors
 
 
 def get_fragments_alla_SAGE(
@@ -722,6 +716,9 @@ def sagepy_search(
     assign_sage_spectrum_q(psms)
     assign_sage_peptide_q(psms)
     assign_sage_protein_q(psms)
+    # what is missing is the distinction between FDR done alla SAGE but on rescored and not.
+    # now, if one chooses feature_prediction, FDR will be done on rescored data.
+    # otherwise on hyperscores alone.
 
     precursors: pd.DataFrame = psm_collection_to_pandas(psms, num_threads=num_threads)
     # TODO: add this to `psm_collection_to_pandas`
@@ -736,6 +733,9 @@ def sagepy_search(
             else psms
         )
     ]
+    precursors = adjust_precursors_to_match_SAGE_naming_and_types(
+        precursors, precursor_stats
+    )
 
     save_df(precursors, results_sage_parquet)
 
@@ -747,8 +747,9 @@ def sagepy_search(
 
     save_df(fragments, matched_fragments_sage_parquet)
 
-    # WHAT SAGEPY GIVES US: predictions of intensities actually only
-    # others than that: no need to do MGF.
+    # WHAT SAGEPY GIVES US:
+    # predictions of intensities, rts, mobilities
+    # no need to do MGF.
 
 
 # psms = [
