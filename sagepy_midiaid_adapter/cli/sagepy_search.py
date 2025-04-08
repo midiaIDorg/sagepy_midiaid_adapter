@@ -3,6 +3,7 @@
 %autoreload 2
 """
 import duckdb
+import numba
 import math
 import functools
 import json
@@ -454,7 +455,64 @@ DB_splits_mergers: dict[
 ] = dict(matteos_happy_merge=matteos_happy_merge, davids_happy_merge=davids_happy_merge)
 
 
-def psms_to_df(
+def adjust_precursors_to_match_SAGE_naming_and_types(
+    precursors: pd.DataFrame,
+    precursor_stats: pd.DataFrame,
+) -> None:
+    """
+    Adjust names and values to have
+    """
+    precursors = precursors.reset_index()
+    precursors = precursors.rename(
+        columns=dict(
+            index="psm_id",
+            spec_idx="MS1_ClusterID",
+            sequence_modified="peptide",
+            decoy="is_decoy",
+            average_ppm="precursor_ppm",
+            delta_ims="delta_mobility",
+        )
+    )
+    precursors["num_proteins"] = precursors.proteins.map(len)
+    precursors.proteins = precursors.proteins.str.join(";")
+    precursors["MS1_ClusterID"] = precursors.MS1_ClusterID.astype(np.uint32)
+    precursors = precursors.sort_values("MS1_ClusterID")
+
+    precursors["label"] = precursors.is_decoy.map({False: -1, True: 1})
+    precursors["peptide_len"] = precursors.sequence.map(len)
+    # ?precursors["semi_enzymatic"]?
+    # if "feature_prediction" in search_conf:
+    #     precursors.predicted_rt
+    #     precursors.rt
+    #     plt.hist( precursors.rt / precursors.predicted_rt, bins=100)
+    #     plt.show()
+
+    precursor_stats.retention_time_wmean.iloc[
+        precursors.MS1_ClusterID
+    ].to_numpy() / 60.0
+
+    plt.scatter(
+        precursor_stats.retention_time_wmean.iloc[precursors.MS1_ClusterID].to_numpy()
+        / 60.0,
+        precursors.predicted_rt - precursors.delta_rt_model,
+    )
+    plt.show()
+
+    precursors.matched_peaks = precursors.matched_peaks.astype(np.int64)
+    precursors.longest_b = precursors.longest_b.astype(np.int64)
+    precursors.longest_y = precursors.longest_y.astype(np.int64)
+    precursors.scored_candidates = precursors.scored_candidates.astype(np.int64)
+
+    precursors["ion_mobility"] = precursor_stats.inv_ion_mobility_wmean.iloc[
+        precursors.MS1_ClusterID
+    ].to_numpy()
+    # delta_mobility = real - predicted
+    precursors["predicted_mobility"] = (
+        precursors["ion_mobility"] - precursors.delta_mobility
+    )
+
+
+def get_fragments_alla_SAGE(
     psms: list[SagepyPsm],
     fragment_type_as_char: bool = True,
     verbose: bool = False,
@@ -505,6 +563,16 @@ def psms_to_df(
         ),
         copy=False,
     )
+
+
+@numba.njit
+def get_average_diff(xx, yy):
+    assert len(xx) == len(yy)
+    N = len(xx)
+    res = 0.0
+    for x, y in zip(xx, yy):
+        res += (x - y) / N
+    return res
 
 
 @click.command(context_settings={"show_default": True})
@@ -642,16 +710,13 @@ def sagepy_search(
     stats["TARGET_DECOY_COLLISION_CNT"] = target_decoy_collisions_stats[True]
     stats["PSMS_WITHOUT_COLLISION_CNT"] = target_decoy_collisions_stats[False]
 
-    for psm in psms:
-        psm.retention_time /= 60.0
-
-    if "rescoring" in search_conf:
+    if "feature_prediction" in search_conf:
         # this needs to be extended / replaced by some function that gets midia specific
-        # features
+        # features. Or we do it in another place, which is a good idea.
         psms = create_feature_space(
             psms=psms,
             verbose=verbose,
-            **search_conf["rescoring"]["feature_space_settings"],
+            **search_conf["feature_prediction"],
         )
 
     # SAGE operations directly exposed via SAGEPY
@@ -660,43 +725,31 @@ def sagepy_search(
     assign_sage_protein_q(psms)
 
     precursors: pd.DataFrame = psm_collection_to_pandas(psms, num_threads=num_threads)
-
-    precursors = precursors.reset_index()
-    precursors = precursors.rename(
-        columns=dict(
-            index="psm_id",
-            spec_idx="MS1_ClusterID",
-            sequence_modified="peptide",
-            decoy="is_decoy",
+    # TODO: add this to `psm_collection_to_pandas`
+    precursors["fragment_ppm"] = [
+        get_average_diff(
+            psm.sage_feature.fragments.mz_calculated,
+            psm.sage_feature.fragments.mz_experimental,
         )
-    )
-    precursors["num_proteins"] = precursors.proteins.map(len)
-    precursors.proteins = precursors.proteins.str.join(";")
-    precursors["filename"] = ""
-    precursors["scannr"] = precursors.MS1_ClusterID
-    precursors["label"] = precursors.is_decoy.map({False: -1, True: 1})
-    precursors["peptide_len"] = precursors.sequence.map(len)
+        for psm in (
+            tqdm(psms, desc="Getting average framgent m/z error in ppm")
+            if verbose
+            else psms
+        )
+    ]
 
-    precursors2 = precursors.set_index("MS1_ClusterID")
-    precursors2.loc[list(map(str, found_in_sagepy_not_sage))]
-    precursors2.loc["100588"]
+    save_df(precursors, results_sage_parquet)
 
-    fragments_df = psms_to_df(
+    fragments: pd.DataFrame = get_fragments_alla_SAGE(
         psms,
-        fragment_type_as_char=True,  # necessary for downstream procedures.
+        fragment_type_as_char=True,  # downstream necessity
         verbose=verbose,
     )
 
-    # precursor_cluster_stats
-    sageprec.MS1_ClusterID
-    venny_cnt(sageprec.MS1_ClusterID, precursors.MS1_ClusterID.astype(int))
+    save_df(fragments, matched_fragments_sage_parquet)
 
-    submitted = [int(q.id) for q in queries]
-    venny_cnt(sageprec.MS1_ClusterID, submitted)
-
-    save_df(precursors, "F9477_1psm.parquet")
-    # fragment_cluster_stats
-    # results_sage_parquet
+    # WHAT SAGEPY GIVES US: predictions of intensities actually only
+    # others than that: no need to do MGF.
 
 
 # psms = [
