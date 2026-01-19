@@ -24,7 +24,8 @@ import numpy.typing as npt
 import typing
 import pandas as pd
 import sagepy.core.scoring
-from imspy.algorithm.rescoring import create_feature_space, re_score_psms
+
+# from imspy.algorithm.rescoring import create_feature_space, re_score_psms
 from pandas_ops.io import read_df
 from pandas_ops.lex_ops import LexicographicIndex
 from pandas_ops.stats import sum_real_good

@@ -13,11 +13,11 @@ authors=[
 ]
 dependencies = [
     "click",
-    "numpy",
     "numba",
+    "numpy",
     "pandas",
     "tqdm",
-    "mmapped_df",
+    "mmappet",
     "pandas_ops",
     "sagepy",
     "sagepy_connector",
